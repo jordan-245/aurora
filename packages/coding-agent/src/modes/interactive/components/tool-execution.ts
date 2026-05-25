@@ -124,11 +124,9 @@ class AsciiBoxFrame implements Component {
 	render(width: number): string[] {
 		const state = this.getState();
 		const hr = theme.glyph("hr") || "-";
-		const open = theme.glyph("toolBracketOpen") || "[";
-		const close = theme.glyph("toolBracketClose") || "]";
 
 		// ── Top border ─────────────────────────────────────────────────────
-		const topLabel = `${open}${open} ${state.toolName} ${close}`;
+		const topLabel = `--[ ${state.toolName} ]`;
 		const topHrCount = Math.max(0, width - topLabel.length - 2); // 2 for "+" corners
 		const topBorder = theme.fg("muted", `+${topLabel}${hr.repeat(topHrCount)}+`);
 
@@ -142,16 +140,22 @@ class AsciiBoxFrame implements Component {
 			const elapsed = state.startTimeMs ? `${((Date.now() - state.startTimeMs) / 1000).toFixed(1)}s` : "?s";
 			const pill = state.isError ? theme.glyph("errorPill") : theme.glyph("successPill");
 			const pillColor: "error" | "success" = state.isError ? "error" : "success";
-			const botLabel = `${open}${open} `;
-			const botSuffix = ` ${close} ${hr}${hr} ${elapsed} ${hr}${hr}+`;
-			const botHrCount = Math.max(0, width - botLabel.length - pill.length - botSuffix.length);
+			// Layout: +--[ <pill> ]<fill> <elapsed> --+
+			const botPrefix = `--[ `; // 4 chars after corner
+			const botClose = ` ]`; // 2 chars after pill
+			const elapsedSuffix = ` ${elapsed} ${hr}${hr}+`; // e.g. " 0.4s --+"
+			const pillWidth = visibleWidth(pill);
+			const botFillCount = Math.max(
+				0,
+				width - 1 - botPrefix.length - pillWidth - botClose.length - elapsedSuffix.length,
+			);
 			bottomBorder =
-				theme.fg("muted", `+${botLabel}`) +
+				theme.fg("muted", `+${botPrefix}`) +
 				theme.fg(pillColor, pill) +
-				theme.fg("muted", hr.repeat(botHrCount) + botSuffix);
+				theme.fg("muted", `${botClose}${hr.repeat(botFillCount)}${elapsedSuffix}`);
 		} else {
 			const elapsed = state.startTimeMs ? `${((Date.now() - state.startTimeMs) / 1000).toFixed(1)}s` : "";
-			const runLabel = elapsed ? `${open} running... ${elapsed} ${close}` : `${open} running... ${close}`;
+			const runLabel = elapsed ? `--[ running... ${elapsed} ]` : `--[ running... ]`;
 			const botHrCount = Math.max(0, width - runLabel.length - 2);
 			bottomBorder = theme.fg("muted", `+${runLabel}${hr.repeat(botHrCount)}+`);
 		}

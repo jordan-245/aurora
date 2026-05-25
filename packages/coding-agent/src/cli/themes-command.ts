@@ -89,9 +89,7 @@ function renderPreview(themeName: string, width: number): string[] {
 	const toolStyle = t.toolBlockStyle();
 	let line4: string;
 	if (toolStyle === "ascii-box") {
-		const open = t.glyph("toolBracketOpen") || "[";
-		const close = t.glyph("toolBracketClose") || "]";
-		const toolLabel = `${open}${open} bash ${close}`;
+		const toolLabel = `--[ bash ]`;
 		const topHr = Math.max(0, width - indent.length - toolLabel.length - 2);
 		line4 = `${indent}${t.fg("muted", `+${toolLabel}${rep(hr, topHr)}+`)}`;
 	} else if (toolStyle === "indent") {
@@ -109,14 +107,16 @@ function renderPreview(themeName: string, width: number): string[] {
 	// ── Line 5: tool result / ok ─────────────────────────────────────────────
 	let line5: string;
 	if (toolStyle === "ascii-box") {
-		const open = t.glyph("toolBracketOpen") || "[";
-		const close = t.glyph("toolBracketClose") || "]";
 		const pill = t.glyph("successPill");
-		const elapsed = " 0.4s ";
-		const botLabel = `${open}${open} `;
-		const botSuffix = ` ${close} ${hr}${hr} ${elapsed}${hr}${hr}+`;
-		const botHr = Math.max(0, width - indent.length - botLabel.length - pill.length - botSuffix.length);
-		line5 = `${indent}${t.fg("muted", `+${botLabel}`)}${t.fg("success", pill)}${t.fg("muted", `${rep(hr, botHr)}${botSuffix}`)}`;
+		// Layout: +--[ <pill> ]<fill> 0.4s --+
+		const botPrefix = `--[ `; // 4 chars after corner
+		const botClose = ` ]`; // 2 chars after pill
+		const elapsedSuffix = ` 0.4s ${hr}${hr}+`; // " 0.4s --+"
+		const botFill = Math.max(
+			0,
+			width - indent.length - 1 - botPrefix.length - pill.length - botClose.length - elapsedSuffix.length,
+		);
+		line5 = `${indent}${t.fg("muted", `+${botPrefix}`)}${t.fg("success", pill)}${t.fg("muted", `${botClose}${rep(hr, botFill)}${elapsedSuffix}`)}`;
 	} else if (toolStyle === "indent") {
 		const gutter = " ".repeat(t.toolGutter());
 		const pill = t.glyph("successPill");
