@@ -102,11 +102,14 @@ class IndentedToolFrame implements Component {
 // ============================================================================
 
 /**
- * Renders tool content inside an ASCII box:
- *   +--[ bash ]----------+
- *   | echo "hi"          |
- *   | hi                 |
- *   +--[ ok ]---- 2.4s --+
+ * Renders tool content inside a box whose corners/edges are theme glyphs.
+ *   Portable ASCII (default):      Rounded (e.g. harness-pro):
+ *     +--[ bash ]--------+           ╭── bash ──────╮
+ *     | echo "hi"        |           │ echo "hi"        │
+ *     +--[ ok ]-- 2.4s --+           ╰── ✓ ──── 2.4s ──╯
+ * Corners/edges come from boxTL/TR/BL/BR/H/V glyphs; the tool name is accented
+ * (toolTitle) and the completion pill is semantic. asciiOnly themes always get
+ * the portable +/-/| set regardless of glyph config.
  */
 class AsciiBoxFrame implements Component {
 	private innerContainer: Container;
@@ -123,15 +126,31 @@ class AsciiBoxFrame implements Component {
 
 	render(width: number): string[] {
 		const state = this.getState();
-		const hr = theme.glyph("hr") || "-";
+
+		// Box-drawing glyphs are theme-driven (rounded / heavy / ascii). asciiOnly themes (brutalist)
+		// always render the portable +/-/| set so they are identical on every terminal.
+		const ascii = theme.isAsciiOnly();
+		const tl = ascii ? "+" : theme.glyph("boxTL") || "+";
+		const tr = ascii ? "+" : theme.glyph("boxTR") || "+";
+		const bl = ascii ? "+" : theme.glyph("boxBL") || "+";
+		const br = ascii ? "+" : theme.glyph("boxBR") || "+";
+		const h = ascii ? "-" : theme.glyph("boxH") || "-";
+		const v = ascii ? "|" : theme.glyph("boxV") || "|";
+		const bo = theme.glyph("toolBracketOpen"); // "[" by default; "" for a bracket-less rounded card
+		const bc = theme.glyph("toolBracketClose"); // "]" by default
+		const edge = (s: string) => theme.fg("border", s);
 
 		// ── Top border ─────────────────────────────────────────────────────
-		const topLabel = `--[ ${state.toolName} ]`;
-		const topHrCount = Math.max(0, width - topLabel.length - 2); // 2 for "+" corners
-		const topBorder = theme.fg("muted", `+${topLabel}${hr.repeat(topHrCount)}+`);
+		// tl h h bo  <tool>  bc h…h tr
+		const topLabel = `${bo} ${state.toolName} ${bc}`; // visible label segment
+		const topFill = Math.max(0, width - 1 /*tl*/ - 2 /*hh*/ - topLabel.length - 1 /*tr*/);
+		const topBorder =
+			edge(`${tl}${h}${h}${bo} `) +
+			theme.fg("toolTitle", theme.bold(state.toolName)) +
+			edge(` ${bc}${h.repeat(topFill)}${tr}`);
 
 		// ── Body ───────────────────────────────────────────────────────────
-		const bodyWidth = Math.max(1, width - 4); // 2 for "| " + 2 for " |"
+		const bodyWidth = Math.max(1, width - 4); // "v " + " v"
 		const bodyLines = this.innerContainer.render(bodyWidth);
 
 		// ── Bottom border ──────────────────────────────────────────────────
@@ -140,24 +159,23 @@ class AsciiBoxFrame implements Component {
 			const elapsed = state.startTimeMs ? `${((Date.now() - state.startTimeMs) / 1000).toFixed(1)}s` : "?s";
 			const pill = state.isError ? theme.glyph("errorPill") : theme.glyph("successPill");
 			const pillColor: "error" | "success" = state.isError ? "error" : "success";
-			// Layout: +--[ <pill> ]<fill> <elapsed> --+
-			const botPrefix = `--[ `; // 4 chars after corner
-			const botClose = ` ]`; // 2 chars after pill
-			const elapsedSuffix = ` ${elapsed} ${hr}${hr}+`; // e.g. " 0.4s --+"
+			// bl h h bo  <pill>  bc h…h  <elapsed>  h h br
 			const pillWidth = visibleWidth(pill);
-			const botFillCount = Math.max(
-				0,
-				width - 1 - botPrefix.length - pillWidth - botClose.length - elapsedSuffix.length,
-			);
+			// non-fill widths: "{bl}{h}{h}{bo} "(4+bo) + pill + " {bc} "(2+bc) + elapsed + " {h}{h}{br}"(4)
+			const botFill = Math.max(0, width - 10 - bo.length - bc.length - pillWidth - elapsed.length);
 			bottomBorder =
-				theme.fg("muted", `+${botPrefix}`) +
+				edge(`${bl}${h}${h}${bo} `) +
 				theme.fg(pillColor, pill) +
-				theme.fg("muted", `${botClose}${hr.repeat(botFillCount)}${elapsedSuffix}`);
+				edge(` ${bc}${h.repeat(botFill)} `) +
+				theme.fg("muted", elapsed) +
+				edge(` ${h}${h}${br}`);
 		} else {
 			const elapsed = state.startTimeMs ? `${((Date.now() - state.startTimeMs) / 1000).toFixed(1)}s` : "";
-			const runLabel = elapsed ? `--[ running... ${elapsed} ]` : `--[ running... ]`;
-			const botHrCount = Math.max(0, width - runLabel.length - 2);
-			bottomBorder = theme.fg("muted", `+${runLabel}${hr.repeat(botHrCount)}+`);
+			const runText = `running${theme.glyph("ellipsis")}${elapsed ? ` ${elapsed}` : ""}`;
+			const runLabel = `${bo} ${runText} ${bc}`; // visible label segment
+			const botFill = Math.max(0, width - 1 - 2 - runLabel.length - 1);
+			bottomBorder =
+				edge(`${bl}${h}${h}${bo} `) + theme.fg("muted", runText) + edge(` ${bc}${h.repeat(botFill)}${br}`);
 		}
 
 		const lines: string[] = [topBorder];
@@ -165,7 +183,7 @@ class AsciiBoxFrame implements Component {
 			// Strip trailing spaces then pad to bodyWidth using visibleWidth (handles all ANSI codes)
 			const stripped = line.replace(/\s+$/, "");
 			const padCount = Math.max(0, bodyWidth - visibleWidth(stripped));
-			lines.push(`${theme.fg("muted", "| ")}${stripped}${" ".repeat(padCount)}${theme.fg("muted", " |")}`);
+			lines.push(`${edge(`${v} `)}${stripped}${" ".repeat(padCount)}${edge(` ${v}`)}`);
 		}
 		lines.push(bottomBorder);
 		return lines;

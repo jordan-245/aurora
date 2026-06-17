@@ -51,6 +51,14 @@ const GlyphsSchema = Type.Optional(
 		toolDots: Type.Optional(GlyphValueSchema),
 		toolBracketOpen: Type.Optional(GlyphValueSchema),
 		toolBracketClose: Type.Optional(GlyphValueSchema),
+		// Box-drawing glyphs for the ascii-box tool frame. Defaults reproduce the
+		// portable +/-/| look; a theme can opt into rounded (╭╮╰╯ ─ │) or heavy borders.
+		boxTL: Type.Optional(GlyphValueSchema),
+		boxTR: Type.Optional(GlyphValueSchema),
+		boxBL: Type.Optional(GlyphValueSchema),
+		boxBR: Type.Optional(GlyphValueSchema),
+		boxH: Type.Optional(GlyphValueSchema),
+		boxV: Type.Optional(GlyphValueSchema),
 		successPill: Type.Optional(GlyphValueSchema),
 		errorPill: Type.Optional(GlyphValueSchema),
 		workingLabel: Type.Optional(GlyphValueSchema),
@@ -175,6 +183,12 @@ export type GlyphName =
 	| "toolDots"
 	| "toolBracketOpen"
 	| "toolBracketClose"
+	| "boxTL"
+	| "boxTR"
+	| "boxBL"
+	| "boxBR"
+	| "boxH"
+	| "boxV"
 	| "successPill"
 	| "errorPill"
 	| "workingLabel";
@@ -208,6 +222,12 @@ type ResolvedGlyphs = {
 	toolDots: string;
 	toolBracketOpen: string;
 	toolBracketClose: string;
+	boxTL: string;
+	boxTR: string;
+	boxBL: string;
+	boxBR: string;
+	boxH: string;
+	boxV: string;
 	successPill: string;
 	errorPill: string;
 	workingLabel: string;
@@ -228,6 +248,13 @@ export const DEFAULT_GLYPHS: ResolvedGlyphs = {
 	toolDots: "·",
 	toolBracketOpen: "[",
 	toolBracketClose: "]",
+	// Defaults match the original hard-coded ascii-box look (+ corners, - edges, | sides).
+	boxTL: "+",
+	boxTR: "+",
+	boxBL: "+",
+	boxBR: "+",
+	boxH: "-",
+	boxV: "|",
 	successPill: "ok",
 	errorPill: "fail",
 	workingLabel: "Working...",
@@ -840,6 +867,12 @@ function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string
 		toolDots: jsonGlyphs.toolDots ?? DEFAULT_GLYPHS.toolDots,
 		toolBracketOpen: jsonGlyphs.toolBracketOpen ?? DEFAULT_GLYPHS.toolBracketOpen,
 		toolBracketClose: jsonGlyphs.toolBracketClose ?? DEFAULT_GLYPHS.toolBracketClose,
+		boxTL: jsonGlyphs.boxTL ?? DEFAULT_GLYPHS.boxTL,
+		boxTR: jsonGlyphs.boxTR ?? DEFAULT_GLYPHS.boxTR,
+		boxBL: jsonGlyphs.boxBL ?? DEFAULT_GLYPHS.boxBL,
+		boxBR: jsonGlyphs.boxBR ?? DEFAULT_GLYPHS.boxBR,
+		boxH: jsonGlyphs.boxH ?? DEFAULT_GLYPHS.boxH,
+		boxV: jsonGlyphs.boxV ?? DEFAULT_GLYPHS.boxV,
 		successPill: jsonGlyphs.successPill ?? DEFAULT_GLYPHS.successPill,
 		errorPill: jsonGlyphs.errorPill ?? DEFAULT_GLYPHS.errorPill,
 		workingLabel: jsonGlyphs.workingLabel ?? DEFAULT_GLYPHS.workingLabel,

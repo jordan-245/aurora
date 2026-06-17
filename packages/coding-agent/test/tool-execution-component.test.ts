@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import { Text, type TUI } from "@earendil-works/pi-tui";
+import { Text, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, test } from "vitest";
 import { getReadmePath } from "../src/config.ts";
@@ -8,7 +8,7 @@ import { type BashOperations, createBashToolDefinition } from "../src/core/tools
 import { createReadTool, createReadToolDefinition } from "../src/core/tools/read.ts";
 import { createWriteToolDefinition } from "../src/core/tools/write.ts";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { initTheme, setTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
 function createBaseToolDefinition(name = "custom_tool"): ToolDefinition {
@@ -331,6 +331,45 @@ describe("ToolExecutionComponent parity", () => {
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("custom_tool");
 		expect(rendered).toContain("done");
+	});
+
+	// ── ascii-box frame: theme-driven corners (guards the hard-coded +/-/| regression class) ──
+	// brutalist is toolBlockStyle:"ascii-box" + asciiOnly:true → the frame MUST stay portable
+	// (+ corners, - edges, | sides) and every framed line MUST be exactly the requested width.
+	test("ascii-box frame stays portable ASCII for asciiOnly themes and fills width exactly", () => {
+		setTheme("brutalist");
+		try {
+			const toolDefinition: ToolDefinition = {
+				...createBaseToolDefinition("bash"),
+				renderCall: () => new Text("echo hi", 0, 0),
+			};
+			const component = new ToolExecutionComponent(
+				"bash",
+				"tool-asciibox",
+				{},
+				{},
+				toolDefinition,
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult({ content: [{ type: "text", text: "hi" }], details: {}, isError: false }, false);
+			const plain = component
+				.render(60)
+				.map((l) => stripAnsi(l))
+				.filter((l) => l.length > 0);
+			const top = plain.find((l) => l.includes("bash")) ?? "";
+			expect(top.startsWith("+--[ ")).toBe(true);
+			expect(top.endsWith("+")).toBe(true);
+			// completion footer: +--[ ok ]----- <elapsed> --+  (elapsed is "?s" with no recorded start time)
+			const bottom = plain[plain.length - 1];
+			expect(bottom).toMatch(/^\+--\[ ok \]-+ [\d.?]+s --\+$/);
+			// every framed line is exactly the requested width (no off-by-one)
+			for (const l of plain) {
+				if (l.startsWith("+") || l.startsWith("|")) expect(visibleWidth(l)).toBe(60);
+			}
+		} finally {
+			setTheme("dark");
+		}
 	});
 
 	test("trims trailing blank display lines from write previews", () => {
