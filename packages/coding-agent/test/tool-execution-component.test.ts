@@ -1,7 +1,7 @@
 import { join, resolve } from "node:path";
 import { Text, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { beforeAll, describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test, vi } from "vitest";
 import { getReadmePath } from "../src/config.ts";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import { type BashOperations, createBashToolDefinition } from "../src/core/tools/bash.ts";
@@ -369,6 +369,49 @@ describe("ToolExecutionComponent parity", () => {
 			}
 		} finally {
 			setTheme("dark");
+		}
+	});
+
+	// ── REGRESSION: completed cards must FREEZE their elapsed clock ──────────────────────────
+	// A finished tool card's footer is computed from Date.now() while running; once complete it must
+	// switch to a frozen endTimeMs. If it keeps using Date.now(), every already-completed (and usually
+	// off-screen) card re-renders ~12-16x/sec, mutating the logical buffer and forcing full-screen
+	// redraws — the visible scroll/jitter under tmux on every keystroke and spinner tick. Guard: a
+	// completed card must render byte-identically across a large wall-clock advance.
+	test("freezes elapsed time on completion so a finished card never re-renders", () => {
+		vi.useFakeTimers();
+		setTheme("brutalist");
+		try {
+			vi.setSystemTime(1_000_000);
+			const toolDefinition: ToolDefinition = {
+				...createBaseToolDefinition("bash"),
+				renderCall: () => new Text("echo hi", 0, 0),
+			};
+			const component = new ToolExecutionComponent(
+				"bash",
+				"tool-freeze",
+				{},
+				{},
+				toolDefinition,
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.markExecutionStarted(); // startTimeMs = 1_000_000
+			vi.setSystemTime(1_002_400); // 2.4s of real execution
+			component.updateResult({ content: [{ type: "text", text: "hi" }], details: {}, isError: false }, false);
+
+			const first = component.render(60).map((l) => stripAnsi(l));
+			const footer1 = first[first.length - 1];
+			expect(footer1).toMatch(/ 2\.4s --\+$/); // elapsed reflects start→end, not "?s"
+
+			// Advance the wall clock far past completion. A frozen card must not change one byte.
+			vi.setSystemTime(1_100_000); // +97.6s later
+			const second = component.render(60).map((l) => stripAnsi(l));
+			expect(second).toEqual(first); // byte-identical → zero buffer churn
+			expect(second[second.length - 1]).toMatch(/ 2\.4s --\+$/); // still 2.4s, NOT ~100s
+		} finally {
+			setTheme("dark");
+			vi.useRealTimers();
 		}
 	});
 

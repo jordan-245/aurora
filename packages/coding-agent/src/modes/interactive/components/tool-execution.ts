@@ -25,7 +25,21 @@ interface IndentFrameState {
 	isPartial: boolean;
 	isError: boolean;
 	startTimeMs: number | undefined;
+	endTimeMs: number | undefined;
 	hasResult: boolean;
+}
+
+// Elapsed-time label for a tool frame, single-sourced so all four call sites agree.
+// CRITICAL: once a tool completes we use the FROZEN endTimeMs, never Date.now() — a finished
+// card's footer is then a pure function of frozen state and never changes between renders.
+// Live Date.now() is used ONLY while the tool is still running (the single bottom-most, on-screen
+// card). Without this freeze every completed card's elapsed digits tick on every render frame;
+// off-screen cards then mutate the logical buffer ~12-16x/sec, forcing full-screen redraws
+// (visible scroll/jitter under tmux) on every keystroke and spinner tick.
+function frameElapsed(state: IndentFrameState): string {
+	if (!state.startTimeMs) return state.isPartial ? "" : "?s";
+	const end = state.isPartial ? Date.now() : (state.endTimeMs ?? Date.now());
+	return `${((end - state.startTimeMs) / 1000).toFixed(1)}s`;
 }
 
 /**
@@ -58,7 +72,7 @@ class IndentedToolFrame implements Component {
 
 		if (state.isPartial) {
 			// ── Running header ─────────────────────────────────────────────
-			const elapsed = state.startTimeMs ? `${((Date.now() - state.startTimeMs) / 1000).toFixed(1)}s` : "";
+			const elapsed = frameElapsed(state);
 			const toolDot = theme.glyph("toolDots");
 			const prefix = `${state.toolName} · running `;
 			const elapsedDisplay = elapsed ? ` ${elapsed}` : "";
@@ -76,7 +90,7 @@ class IndentedToolFrame implements Component {
 
 		if (!state.isPartial && state.hasResult) {
 			// ── Completion footer ──────────────────────────────────────────
-			const elapsed = state.startTimeMs ? `${((Date.now() - state.startTimeMs) / 1000).toFixed(1)}s` : "?s";
+			const elapsed = frameElapsed(state);
 			const hrChar = theme.glyph("hr");
 			const pill = state.isError ? theme.glyph("errorPill") : theme.glyph("successPill");
 			const pillColor: "error" | "success" = state.isError ? "error" : "success";
@@ -157,7 +171,7 @@ class AsciiBoxFrame implements Component {
 		// ── Bottom border ──────────────────────────────────────────────────
 		let bottomBorder: string;
 		if (!state.isPartial && state.hasResult) {
-			const elapsed = state.startTimeMs ? `${((Date.now() - state.startTimeMs) / 1000).toFixed(1)}s` : "?s";
+			const elapsed = frameElapsed(state);
 			const pill = state.isError ? theme.glyph("errorPill") : theme.glyph("successPill");
 			const pillColor: "error" | "success" = state.isError ? "error" : "success";
 			// bl h h bo  <pill>  bc h…h  <elapsed>  h h br
@@ -171,7 +185,7 @@ class AsciiBoxFrame implements Component {
 				theme.fg("muted", elapsed) +
 				edge(` ${h}${h}${br}`);
 		} else {
-			const elapsed = state.startTimeMs ? `${((Date.now() - state.startTimeMs) / 1000).toFixed(1)}s` : "";
+			const elapsed = frameElapsed(state);
 			const runText = `running${theme.glyph("ellipsis")}${elapsed ? ` ${elapsed}` : ""}`;
 			const runLabel = `${bo} ${runText} ${bc}`; // visible label segment
 			const botFill = Math.max(0, width - 1 - 2 - runLabel.length - 1);
@@ -201,6 +215,7 @@ export class ToolExecutionComponent extends Container {
 	private indentContainer: Container;
 	private indentFrame: IndentedToolFrame | AsciiBoxFrame | undefined;
 	private startTimeMs: number | undefined;
+	private endTimeMs: number | undefined;
 	private toolBlockStyleAtConstruct: ToolBlockStyle;
 	// ─────────────────────────────────────────────────────────────────────
 	private callRendererComponent?: Component;
@@ -276,6 +291,7 @@ export class ToolExecutionComponent extends Container {
 				isPartial: this.isPartial,
 				isError: this.result?.isError ?? false,
 				startTimeMs: this.startTimeMs,
+				endTimeMs: this.endTimeMs,
 				hasResult: this.result !== undefined,
 			});
 
@@ -394,6 +410,11 @@ export class ToolExecutionComponent extends Container {
 	): void {
 		this.result = result;
 		this.isPartial = isPartial;
+		// Freeze the elapsed clock the moment the tool first reports a final (non-partial) result,
+		// so the completed card stops re-rendering. Freeze-once: the first completion timestamp wins.
+		if (!isPartial && this.endTimeMs === undefined) {
+			this.endTimeMs = Date.now();
+		}
 		this.updateDisplay();
 		this.maybeConvertImagesForKitty();
 	}

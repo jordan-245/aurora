@@ -1133,8 +1133,31 @@ export class TUI extends Container {
 		}
 
 		// Differential rendering can only touch what was actually visible.
-		// If the first changed line is above the previous viewport, we need a full redraw.
+		// Two sub-cases when the first changed line is above the previous viewport:
+		//
+		// (a) ENTIRELY off-screen: lastChanged < prevViewportTop — nothing visible changed.
+		//     Absorb the new state without writing anything to the terminal. Issuing a
+		//     full clear+repaint here would flicker on terminals and multiplexers (tmux)
+		//     that don't honour synchronized-output, and it is pure wasted work: the user
+		//     cannot see above-viewport lines. Animated spinners re-render ~12–16×/sec, and
+		//     off-screen elapsed-time counters change every frame — without this guard that
+		//     causes ~16 full-screen clears/sec, creating visible jitter inside tmux.
+		//
+		// (b) STRADDLING: firstChanged < prevViewportTop <= lastChanged — the changed region
+		//     crosses the viewport boundary. We cannot patch only the visible part without
+		//     risking a mismatched cursor, so we still fall back to a full redraw.
 		if (firstChanged < prevViewportTop) {
+			if (lastChanged < prevViewportTop) {
+				// Entirely off-screen — absorb new state, no drawing needed.
+				this.positionHardwareCursor(cursorPos, newLines.length);
+				this.previousLines = newLines;
+				this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+				this.previousWidth = width;
+				this.previousHeight = height;
+				this.previousViewportTop = prevViewportTop;
+				return;
+			}
+			// Straddling case — change spans the viewport boundary; must full-render.
 			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
 			fullRender(true);
 			return;
