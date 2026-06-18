@@ -1,7 +1,15 @@
-# Aurora
+<p align="center">
+  <img src="assets/aurora-banner.gif" alt="Aurora — the orchestrated coding agent" width="820">
+</p>
 
-**A branded agent harness.** Aurora is a coding agent with a **specialised-sub-agent delegation
-harness built in** and a premium neon TUI — one command, `aurora`.
+<h1 align="center">Aurora</h1>
+
+<p align="center"><b>A branded agent harness</b> — a coding agent with a specialised-sub-agent delegation harness built in, and a premium neon TUI. One command: <code>aurora</code>.</p>
+
+---
+
+Aurora is a coding agent with a **specialised-sub-agent delegation harness built in** and a premium
+neon TUI — one command, `aurora`.
 
 Aurora gives you a single agent that can **decompose a goal, write metaprompts, and fan the work out
 to specialised, tool-restricted, model-tiered sub-agents in parallel** — with output-contract
