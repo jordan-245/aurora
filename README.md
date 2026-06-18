@@ -1,89 +1,90 @@
-<p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
-  </a>
-</p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-</p>
-<p align="center">
-  <a href="https://pi.dev">pi.dev</a> domain graciously donated by
-  <br /><br />
-  <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
-</p>
+# Aurora
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+**A branded agent harness.** Aurora is a coding agent with a **specialised-sub-agent delegation
+harness built in** and a premium neon TUI — one command, `aurora`.
+
+Aurora gives you a single agent that can **decompose a goal, write metaprompts, and fan the work out
+to specialised, tool-restricted, model-tiered sub-agents in parallel** — with output-contract
+validation, deterministic verification, a window-budget governor, safety guards, a live multi-agent
+dashboard, named team recipes, and an optional warm worker pool. It looks like Aurora out of the box:
+a sub-zero gradient `AURORA` wordmark, rounded box tool-cards, bordered messages, breathing gradient
+spinner.
+
+> **Cost model:** Aurora drives sub-agents through your existing Claude subscription via OAuth (it
+> ejects `ANTHROPIC_API_KEY` so calls don't hit pay-per-token billing). Bring your own authenticated
+> login; Aurora adds no separate API key.
 
 ---
 
-# Pi Agent Harness Mono Repo
-
-This is the home of the pi agent harness project including our self extensible coding agent.
-
-* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
-* **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
-* **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
-
-To learn more about pi:
-
-* [Visit pi.dev](https://pi.dev), the project website with demos
-* [Read the documentation](https://pi.dev/docs/latest), but you can also ask the agent to explain itself
-
-## Share your OSS coding agent sessions
-
-If you use pi or other coding agents for open source work, please share your sessions.
-
-Public OSS session data helps improve coding agents with real-world tasks, tool use, failures, and fixes instead of toy benchmarks.
-
-For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
-
-To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
-
-You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
-
-I regularly publish my own `pi-mono` work sessions here:
-
-- [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
-
-## All Packages
-
-| Package | Description |
-|---------|-------------|
-| **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
-| **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
-| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
-| **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
-
-For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).
-
-## Development
+## Install
 
 ```bash
-npm install --ignore-scripts  # Install all dependencies without running lifecycle scripts
-npm run build        # Build all packages
-npm run check        # Lint, format, and type check
-./test.sh            # Run tests (skips LLM-dependent tests without API keys)
-./pi-test.sh         # Run pi from sources (can be run from any directory)
+git clone https://github.com/jordan-245/aurora.git
+cd aurora
+npm install
+npm run build
+npm link            # puts `aurora` on your PATH
+
+aurora login        # one-time: authenticate (OAuth)
+aurora              # start
 ```
 
-## Supply-chain hardening
+Requires **Node ≥ 22**. Config lives in `~/.aurora/`. Your normal tooling is untouched.
 
-We treat npm dependency changes as reviewed code changes.
+## What you get
 
-- Direct external dependencies are pinned to exact versions. Internal workspace packages remain version-ranged.
-- `.npmrc` sets `save-exact=true` and `min-release-age=2` to avoid same-day dependency releases during npm resolution.
-- `package-lock.json` is the dependency ground truth. Pre-commit blocks accidental lockfile commits unless `PI_ALLOW_LOCKFILE_CHANGE=1` is set.
-- `npm run check` verifies pinned direct deps, native TypeScript import compatibility, and the generated coding-agent shrinkwrap.
-- The published CLI package includes `packages/coding-agent/npm-shrinkwrap.json`, generated from the root lockfile, to pin transitive deps for npm users.
-- Release smoke tests use `npm run release:local` to build, pack, and create isolated npm and Bun installs outside the repo before publishing.
-- Local release installs, documented npm installs, and `pi update --self` use `--ignore-scripts` where supported.
-- CI installs with `npm ci --ignore-scripts`, and a scheduled GitHub workflow runs `npm audit --omit=dev` plus `npm audit signatures --omit=dev`.
-- Shrinkwrap generation has an explicit allowlist for dependency lifecycle scripts; new lifecycle-script deps fail checks until reviewed.
+- **The agent** — `aurora`: read / bash / edit / write tools, sessions, a polished interactive TUI.
+- **The harness, built in** (zero setup): the `spawn_agent` tool family is auto-loaded —
+  - `spawn_agent({ agent, prompt })` — delegate one task to a specialist.
+  - `spawn_agents({ tasks: [...] })` — parallel fan-out (adaptive warm-pool for big batches).
+  - `run_team({ team, vars })` — named recipes: sequential stages, parallel steps.
+  - a live multi-agent **TUI dashboard** (`/harness-drill`, `/harness-web`).
+- **The aurora look** — the `aurora` theme is the default; switch anytime with `aurora themes <name>`.
+
+## Specialists (built-in registry)
+
+| agent | tier | tools | output contract |
+|---|---|---|---|
+| `scout` | fast | read · grep · find · ls | `## findings` + `## confidence` |
+| `builder` | standard | read · edit · write · bash · grep · find · ls | `## change-summary` + `## verification` |
+| `reviewer` | fast | read · grep · find · ls · bash | `## verdict` + `## claims` + `## could-not-verify` |
+| `orchestrator` | frontier | read · grep · find · ls + spawn tools | `## delegated` + `## synthesis` |
+
+A **load-time, fail-closed validator** rejects unsafe shapes (an orchestrator with write/bash; a
+worker with any delegation tool; a write-capable bundle scoped into a protected path). Workers are
+spawned with a strict `--tools` allowlist, so sub-agents never get delegation tools.
+
+**Add a specialist** = drop an `agent.json` + `SKILL.md` in `packages/coding-agent/src/builtin/harness/agents/<name>/`,
+or per-project in `<project>/.pi/agents/`. Teams live alongside in `…/harness/teams/` or
+`<project>/.pi/teams/`.
+
+## Safety (trustable headless)
+- **Deterministic verify** — `spawn_agent({ verify: "<cmd>" })`; the harness runs the acceptance
+  command itself and a failure overrides the agent's own claim.
+- **Tool-layer guard** — every write/exec-capable worker blocks destructive bash and writes outside
+  the project root / into protected paths.
+- **builder→reviewer auto-pairing** — `spawn_agent({ review: true })` runs the reviewer over the git
+  diff and fails closed unless it APPROVEs.
+
+## Configuration (all optional)
+`AURORA_CODING_AGENT_DIR` (config home, default `~/.aurora`), `AURORA_MODEL` / `AURORA_BIN`,
+`HARNESS_AGENTS_DIR` / `HARNESS_TEAMS_DIR`, `HARNESS_POOL_SIZE`. The harness model tiers default to
+Claude Opus / Sonnet / Haiku.
+
+## Layout
+```
+packages/                         the agent engine (tui · ai · agent · coding-agent)
+packages/coding-agent/            the `aurora` CLI
+  src/builtin/extensions/         built-in, auto-loaded extensions (the harness tools + dashboard)
+  src/builtin/harness/            the harness: registry · validator · spawn · governor · pool · teams
+  src/modes/interactive/theme/    themes incl. aurora (default) + harness
+SPEC.md                           full system specification
+NOTICE / LICENSE                  built on Pi (MIT); see below
+```
+
+## Built on Pi
+Aurora is built on the [Pi coding agent](https://github.com/badlogic/pi-mono) (MIT © Mario Zechner).
+See [`NOTICE`](NOTICE) and [`LICENSE`](LICENSE).
 
 ## License
-
-MIT
+MIT — see [LICENSE](LICENSE).
