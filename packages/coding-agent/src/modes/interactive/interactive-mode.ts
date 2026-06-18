@@ -45,6 +45,7 @@ import {
 	Text,
 	TruncatedText,
 	TUI,
+	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
@@ -95,8 +96,10 @@ import { ensureTool } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
+import { BannerAnimator } from "./components/banner-animator.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BorderedLoader } from "./components/bordered-loader.ts";
+import { MessageBoxFrame } from "./components/box-frame.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CountdownTimer } from "./components/countdown-timer.ts";
@@ -109,6 +112,7 @@ import { ExtensionEditorComponent } from "./components/extension-editor.ts";
 import { ExtensionInputComponent } from "./components/extension-input.ts";
 import { ExtensionSelectorComponent } from "./components/extension-selector.ts";
 import { FooterComponent } from "./components/footer.ts";
+import { FunctionalLines } from "./components/functional-lines.ts";
 import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.ts";
 import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
@@ -150,6 +154,7 @@ function isExpandable(obj: unknown): obj is Expandable {
 class ExpandableText extends Text implements Expandable {
 	private readonly getCollapsedText: () => string;
 	private readonly getExpandedText: () => string;
+	private expanded: boolean;
 
 	constructor(
 		getCollapsedText: () => string,
@@ -161,10 +166,17 @@ class ExpandableText extends Text implements Expandable {
 		super(expanded ? getExpandedText() : getCollapsedText(), paddingX, paddingY);
 		this.getCollapsedText = getCollapsedText;
 		this.getExpandedText = getExpandedText;
+		this.expanded = expanded;
 	}
 
 	setExpanded(expanded: boolean): void {
+		this.expanded = expanded;
 		this.setText(expanded ? this.getExpandedText() : this.getCollapsedText());
+	}
+
+	/** Re-evaluate the (possibly dynamic) content for the current expansion state. */
+	refresh(): void {
+		this.setText(this.expanded ? this.getExpandedText() : this.getCollapsedText());
 	}
 }
 
@@ -342,6 +354,8 @@ export class InteractiveMode {
 
 	// Built-in header (logo + keybinding hints + changelog)
 	private builtInHeader: Component | undefined = undefined;
+	/** Continuous animated banner (premium themes only, e.g. aurora comet); undefined when not animating. */
+	private bannerAnim: BannerAnimator | undefined = undefined;
 
 	// Custom header from extension (undefined = use built-in header)
 	private customHeader: (Component & { dispose?(): void }) | undefined = undefined;
@@ -402,7 +416,7 @@ export class InteractiveMode {
 		// Honor a PI_THEME / --theme override (main.ts unifies the flag into PI_THEME) so an explicitly
 		// selected theme is NOT clobbered back to the settings.json default when interactive mode starts.
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
-		initTheme(process.env.PI_THEME ?? this.settingsManager.getTheme(), true);
+		initTheme(this.settingsManager.getEffectiveTheme(), true);
 	}
 
 	private getAutocompleteSourceTag(sourceInfo?: SourceInfo): string | undefined {
@@ -606,20 +620,48 @@ export class InteractiveMode {
 
 		// Add header with keybindings from config (unless silenced)
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-			// Premium themes (e.g. aurora) ship a gradient wordmark banner. Render it
-			// when it fits the terminal; otherwise fall back to the plain bold logo.
-			// Width-guarded so narrow terminals never get a wrapped, broken wordmark.
+			// Premium "branded" themes (e.g. aurora) ship a gradient wordmark banner. When it fits
+			// the terminal we render a CLEAN startup: the gradient wordmark + a brief system-info
+			// line, and we suppress the verbose instructions + full loaded-resource listing (both
+			// stay one keystroke away via ctrl+o / --verbose). Narrow terminals and plain themes
+			// fall back to Pi's normal bold logo + instructions + listing. isBrandedStartup() is the
+			// single source of truth shared with showLoadedResources so the two never disagree.
 			const bannerLines = theme.bannerLines();
-			const termCols = process.stdout.columns ?? 80;
-			let logo: string;
-			if (bannerLines && bannerLines.length > 0 && theme.bannerWidth() <= termCols - 2) {
+			const branded = this.isBrandedStartup();
+			// `logo` is a live value: with a premium reveal animation it returns the current frame and
+			// settles to the static gradient wordmark; otherwise it is a constant. The ExpandableText
+			// content arrows below call logo() on every refresh, so the animator drives it by refreshing
+			// the header each tick.
+			let logo: () => string;
+			if (branded && bannerLines) {
 				const tagline = theme.bannerTagline();
 				const taglineLine = tagline
 					? `${theme.fg("muted", tagline)}${theme.fg("dim", `  ·  v${this.version}`)}`
 					: theme.fg("dim", `v${this.version}`);
-				logo = `${bannerLines.join("\n")}\n${taglineLine}`;
+				const settledWordmark = bannerLines.join("\n");
+				// Premium continuous animation (aurora "comet"): the neon wordmark's gradient drifts boldly
+				// while a bright glint sweeps the word shedding a comet trail, looping seamlessly. Only on a
+				// real TTY — piped/redirected output would otherwise be spammed with escape sequences, so
+				// there we show the static gradient banner instead.
+				const cometFrames = theme.auroraBannerCometFrames();
+				if (cometFrames && process.stdout.isTTY) {
+					this.bannerAnim = new BannerAnimator(
+						cometFrames,
+						theme.bannerCometIntervalMs(),
+						() => {
+							if (this.builtInHeader instanceof ExpandableText) this.builtInHeader.refresh();
+							this.ui.requestRender();
+						},
+						// Freeze the banner whenever it has scrolled out of view (top no longer on-screen). A
+						// frame change above the viewport forces a flickering full-screen repaint on tmux; gating
+						// on topVisible keeps the shimmer only while the header is actually visible → zero jitter.
+						() => this.ui.topVisible,
+					);
+				}
+				logo = () => `${this.bannerAnim?.current() ?? settledWordmark}\n${taglineLine}`;
 			} else {
-				logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
+				const staticLogo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
+				logo = () => staticLogo;
 			}
 
 			// Build startup instructions using keybinding hint helpers
@@ -661,17 +703,70 @@ export class InteractiveMode {
 				"dim",
 				`Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.`,
 			);
+			// Branded clean startup: gradient wordmark + a brief system-info line (model · cwd ·
+			// resource counts) + one compact hint. The full instruction list, onboarding paragraph,
+			// and loaded-resource listing stay one keystroke away (ctrl+o expand / --verbose).
+			const brandedBrief = (): string => {
+				// model [· thinking]
+				const modelId = this.session.model?.id ?? "—";
+				const think = this.session.thinkingLevel;
+				const modelStr =
+					theme.fg("accent", modelId) +
+					(think && think !== "off" ? theme.fg("muted", " · ") + theme.fg("muted", String(think)) : "");
+				// cwd [(git branch)] — same convention as the footer (no extra glyph dependency)
+				const cwd = this.formatDisplayPath(this.sessionManager.getCwd());
+				const branch = this.footerDataProvider?.getGitBranch();
+				const cwdStr = theme.fg("muted", cwd) + (branch ? theme.fg("dim", ` (${branch})`) : "");
+				const nSkills = this.session.resourceLoader.getSkills().skills.length;
+				const nPrompts = this.session.promptTemplates.length;
+				const nExt = this.session.resourceLoader.getExtensions().extensions.length;
+				const counts = [
+					`${nSkills} skill${nSkills === 1 ? "" : "s"}`,
+					`${nPrompts} prompt${nPrompts === 1 ? "" : "s"}`,
+					`${nExt} extension${nExt === 1 ? "" : "s"}`,
+				].join(theme.fg("muted", " · "));
+				const infoLine = theme.fg("muted", "model ") + modelStr + theme.fg("muted", "   ·   ") + cwdStr;
+				return `${infoLine}\n${theme.fg("dim", counts)}`;
+			};
+			const brandedHint = [
+				rawKeyHint("/", "commands"),
+				rawKeyHint("!", "bash"),
+				hint("app.tools.expand", "help & resources"),
+			].join(theme.fg("muted", " · "));
+			// Hermes-inspired bordered "session card": the gradient wordmark stays UNBOXED and animated
+			// above; the live session info (model · thinking / cwd (branch) / resource counts) + the hint
+			// sit in a rounded box below — a clean, premium launch panel. Built ONLY for branded startups
+			// that fit; plain themes keep Pi's inline header (regression-safe). The body re-runs each frame
+			// (FunctionalLines) so model/branch stay live, and every line is truncated to the inner width
+			// so the frame can never break on a narrow terminal.
+			let sessionCard: MessageBoxFrame | undefined;
+			if (branded) {
+				const cardLabel = (theme.name ?? "session").toUpperCase();
+				sessionCard = new MessageBoxFrame(
+					new FunctionalLines((innerWidth) =>
+						[...brandedBrief().split("\n"), "", brandedHint].map((line) =>
+							line === "" ? "" : truncateToWidth(line, innerWidth),
+						),
+					),
+					{ label: cardLabel, borderColor: "border", labelColor: "accent" },
+				);
+			}
+
 			this.builtInHeader = new ExpandableText(
-				() => `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`,
-				() => `${logo}\n${expandedInstructions}\n\n${onboarding}`,
+				() => (branded ? logo() : `${logo()}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`),
+				() => `${logo()}\n${expandedInstructions}\n\n${onboarding}`,
 				this.getStartupExpansionState(),
 				1,
 				0,
 			);
 
-			// Setup UI layout
+			// Setup UI layout: wordmark header, then (branded) the bordered session card.
 			this.headerContainer.addChild(new Spacer(1));
 			this.headerContainer.addChild(this.builtInHeader);
+			if (sessionCard) {
+				this.headerContainer.addChild(new Spacer(1));
+				this.headerContainer.addChild(sessionCard);
+			}
 			this.headerContainer.addChild(new Spacer(1));
 		} else {
 			// Minimal header when silenced
@@ -695,6 +790,9 @@ export class InteractiveMode {
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
 		this.isInitialized = true;
+
+		// Kick off the continuous animated banner (premium themes on a TTY). Stops on teardown.
+		this.bannerAnim?.start();
 
 		// Initialize extensions first so resources are shown before messages
 		await this.rebindCurrentSession();
@@ -738,19 +836,26 @@ export class InteractiveMode {
 	async run(): Promise<void> {
 		await this.init();
 
-		// Start version check asynchronously
-		checkForNewPiVersion(this.version).then((newRelease) => {
-			if (newRelease) {
-				this.showNewVersionNotification(newRelease);
-			}
-		});
+		// Upstream update notifications (version + package). A branded build (the active theme ships a
+		// `banner` wordmark = its own fork identity) must NOT compare itself to the upstream pi npm
+		// release: its pinned core version always looks "behind", producing a perpetual false "Update
+		// Available" whose `pi update` would replace the fork. So branded forks skip the upstream checks
+		// entirely; plain Pi (no banner) is unchanged and still checks. Width-independent by design.
+		if (!this.isBrandedBuild()) {
+			// Start version check asynchronously
+			checkForNewPiVersion(this.version).then((newRelease) => {
+				if (newRelease) {
+					this.showNewVersionNotification(newRelease);
+				}
+			});
 
-		// Start package update check asynchronously
-		this.checkForPackageUpdates().then((updates) => {
-			if (updates.length > 0) {
-				this.showPackageUpdateNotification(updates);
-			}
-		});
+			// Start package update check asynchronously
+			this.checkForPackageUpdates().then((updates) => {
+				if (updates.length > 0) {
+					this.showPackageUpdateNotification(updates);
+				}
+			});
+		}
 
 		// Check tmux keyboard setup asynchronously
 		this.checkTmuxKeyboardSetup().then((warning) => {
@@ -1301,13 +1406,48 @@ export class InteractiveMode {
 		return lines.join("\n");
 	}
 
+	/**
+	 * A premium "branded" startup = the active theme ships a wordmark banner that fits the current
+	 * terminal width. Such themes render a clean header (gradient wordmark + brief system-info) and
+	 * suppress the verbose [Context]/[Skills]/… loaded-resource listing by default (counts live in
+	 * the header instead). Single source of truth shared by the startup header and showLoadedResources
+	 * so the two can never disagree (e.g. wordmark shown but listing also dumped).
+	 */
+	private isBrandedStartup(): boolean {
+		const lines = theme.bannerLines();
+		if (!lines || lines.length === 0) return false;
+		const termCols = process.stdout.columns ?? 80;
+		return theme.bannerWidth() <= termCols - 2;
+	}
+
+	/**
+	 * Whether this is a BRANDED build (the active theme ships a `banner` wordmark = its own fork
+	 * identity). Unlike isBrandedStartup() this is width-INDEPENDENT: it answers "is this a fork?",
+	 * not "does the wordmark fit right now?". Used to suppress upstream pi update/version nags, which
+	 * are semantically wrong for a pinned fork (its core version always looks behind upstream, and
+	 * `pi update` would replace the fork). Plain Pi (no banner) returns false ⇒ update checks run.
+	 */
+	private isBrandedBuild(): boolean {
+		const lines = theme.bannerLines();
+		return !!lines && lines.length > 0;
+	}
+
 	private showLoadedResources(options?: {
 		extensions?: Array<{ path: string; sourceInfo?: SourceInfo }>;
 		force?: boolean;
 		showDiagnosticsWhenQuiet?: boolean;
 	}): void {
-		const showListing = options?.force || this.options.verbose || !this.settingsManager.getQuietStartup();
-		const showDiagnostics = showListing || options?.showDiagnosticsWhenQuiet === true;
+		// Branded banner themes show resource COUNTS in the startup header instead of the full listing,
+		// keeping the default startup clean. The full listing is still available via --verbose or an
+		// explicit force; diagnostics (below) are always evaluated regardless. Non-branded themes are
+		// unchanged. Gated on the SAME predicate as the header so a narrow terminal (banner fallback)
+		// still gets the normal listing.
+		const wantStartupOutput = options?.force || this.options.verbose || !this.settingsManager.getQuietStartup();
+		const brandedClean = !options?.force && !this.options.verbose && this.isBrandedStartup();
+		const showListing = wantStartupOutput && !brandedClean;
+		// Diagnostics (skill/prompt/extension conflicts) are honest, only-when-broken warnings — keep
+		// surfacing them even on the clean branded startup; suppressing the LISTING must not hide errors.
+		const showDiagnostics = wantStartupOutput || options?.showDiagnosticsWhenQuiet === true;
 		if (!showListing && !showDiagnostics) {
 			return;
 		}
@@ -1713,7 +1853,10 @@ export class InteractiveMode {
 		// Premium themes ship a signature gradient → build pre-coloured spinner frames
 		// whose hue breathes through the gradient each tick (an animated neon shimmer).
 		// Only when no extension supplied a custom indicator.
-		const gradientFrames = this.workingIndicatorOptions ? undefined : theme.gradientSpinnerFrames();
+		// Prefer the aurora wave ribbon (premium opt-in), else the breathing single-glyph spinner.
+		const gradientFrames = this.workingIndicatorOptions
+			? undefined
+			: (theme.auroraSpinnerFrames() ?? theme.gradientSpinnerFrames());
 		const indicator = this.workingIndicatorOptions ?? {
 			frames: gradientFrames ?? theme.spinnerFrames(),
 			intervalMs: theme.spinnerIntervalMs(),
@@ -4946,7 +5089,9 @@ export class InteractiveMode {
 			}
 			setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
 			this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
-			const themeName = this.settingsManager.getTheme();
+			// Honor the PI_THEME override (e.g. a launcher's `--theme <name>`), not just
+			// settings.json — otherwise /reload silently reverts the active theme.
+			const themeName = this.settingsManager.getEffectiveTheme();
 			const themeResult = themeName ? setTheme(themeName, true) : { success: true };
 			if (!themeResult.success) {
 				this.showError(`Failed to load theme "${themeName}": ${themeResult.error}\nFell back to dark theme.`);
@@ -5583,6 +5728,7 @@ export class InteractiveMode {
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}
+		this.bannerAnim?.stop();
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;

@@ -1,10 +1,11 @@
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Container, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, test } from "vitest";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
 import { MessageBoxFrame } from "../src/modes/interactive/components/box-frame.ts";
+import { FunctionalLines } from "../src/modes/interactive/components/functional-lines.ts";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
 import { initTheme, loadThemeFromPath, setThemeInstance } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
@@ -55,6 +56,30 @@ describe("MessageBoxFrame", () => {
 			expect(lines[0].endsWith("╮")).toBe(true);
 			expect(lines[lines.length - 1].startsWith("╰")).toBe(true);
 			expect(lines[lines.length - 1].endsWith("╯")).toBe(true);
+			for (const l of lines) expect(visibleWidth(l)).toBe(width);
+		}
+	});
+
+	test("branded session card pattern: FunctionalLines + truncate never breaks the frame", () => {
+		// Guards the startup session card (interactive-mode): a dynamic, possibly-overlong body wrapped
+		// in MessageBoxFrame must stay width-exact at every terminal width, so the rounded frame can never
+		// be split by a long model id / cwd / branch. Mirrors the real construction (truncate to inner w).
+		useTheme({ layout: { messageStyle: "box" }, glyphs: ROUNDED_GLYPHS });
+		const longBody = [
+			"model claude-opus-4-8 · xhigh   ·   ~/very/deeply/nested/working/directory/path (feature/some-very-long-branch-name)",
+			"50 skills · 7 prompts · 15 extensions",
+			"",
+			"/ commands · ! bash · ctrl+o help & resources",
+		];
+		const card = new MessageBoxFrame(
+			new FunctionalLines((innerWidth) => longBody.map((l) => (l === "" ? "" : truncateToWidth(l, innerWidth)))),
+			{ label: "AURORA", borderColor: "border", labelColor: "accent" },
+		);
+		for (const width of [40, 60, 80, 120]) {
+			const lines = card.render(width).map(stripAnsi);
+			expect(lines[0].startsWith("╭── AURORA ")).toBe(true);
+			expect(lines[0].endsWith("╮")).toBe(true);
+			expect(lines[lines.length - 1]).toMatch(/^╰─+╯$/);
 			for (const l of lines) expect(visibleWidth(l)).toBe(width);
 		}
 	});

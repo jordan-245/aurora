@@ -17,7 +17,7 @@
  * config, so they render identically on every terminal.
  */
 
-import { type Component, type Container, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, visibleWidth } from "@earendil-works/pi-tui";
 import { type ThemeColor, theme } from "../theme/theme.ts";
 
 export interface BoxGlyphs {
@@ -85,7 +85,7 @@ export interface MessageBoxOptions {
 }
 
 /**
- * Wraps a body Container in a titled rounded box:
+ * Wraps any renderable body Component in a titled rounded box:
  *
  *   ╭── YOU ─────────────────────────────╮
  *   │ message text, markdown-rendered     │
@@ -96,10 +96,10 @@ export interface MessageBoxOptions {
  * is delegated to {@link wrapBoxBody} so it can never drift from the tool card.
  */
 export class MessageBoxFrame implements Component {
-	private inner: Container;
+	private inner: Component;
 	private opts: MessageBoxOptions;
 
-	constructor(inner: Container, opts: MessageBoxOptions) {
+	constructor(inner: Component, opts: MessageBoxOptions) {
 		this.inner = inner;
 		this.opts = opts;
 	}
