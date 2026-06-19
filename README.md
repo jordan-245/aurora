@@ -1,6 +1,10 @@
-<h1 align="center">Summon</h1>
+<p align="center">
+  <img src="docs/banner.svg" alt="Summon — the orchestrated coding agent" width="612"/>
+</p>
 
-<p align="center"><b>An agent harness you can scale.</b> A coding agent with a built-in specialised-sub-agent delegation harness and a premium neon TUI — one command: <code>summon</code>.</p>
+<p align="center">
+  <b>An agent harness you can scale.</b> A coding agent with a built-in specialised sub-agent delegation harness and a premium neon TUI — one command: <code>summon</code>.
+</p>
 
 <p align="center"><i>Summon agents. Give them goals. Watch the work fan out.</i></p>
 

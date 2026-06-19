@@ -125,7 +125,7 @@
     "footerStyle": "single-line",
     "footerSeparator": "  ·  ",
     "spinnerStyle": "wave",
-    "bannerAnimation": "comet",
+    "bannerAnimation": "constellation",
     "asciiOnly": false
   },
   "export": {
