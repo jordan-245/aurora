@@ -40,9 +40,9 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 			// purely on the noTools semantics for its own dynamic_tool extension.
 			builtinExtensionsDir: null,
 			extensionFactories: [
-				(pi) => {
-					pi.on("session_start", () => {
-						pi.registerTool({
+				(summon) => {
+					summon.on("session_start", () => {
+						summon.registerTool({
 							name: "dynamic_tool",
 							label: "Dynamic Tool",
 							description: "Tool registered from session_start",

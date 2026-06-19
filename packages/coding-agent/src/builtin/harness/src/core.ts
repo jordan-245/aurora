@@ -261,7 +261,7 @@ function runVerifyShell(cmd: string, cwd: string): { status: number | null; stdo
 
 // ── $0-OAuth canary ───────────────────────────────────────────────────────────
 // Make "a worker spawn that silently bills pay-per-token" UNREPRESENTABLE. Every spawn path
-// (oneshot `pi -p` + pooled `pi --mode rpc`) constructs its env via spawnEnv() and MUST pass
+// (oneshot `summon -p` + pooled `summon --mode rpc`) constructs its env via spawnEnv() and MUST pass
 // through this canary before exec — so the $0 routing rule is tool-layer-enforced, not convention.
 // (Routing rule: ANY non-empty --system-prompt routes to the Claude-Max subscription; a present
 // ANTHROPIC_API_KEY makes the CLI silently prefer the key and bill it.)
@@ -556,7 +556,7 @@ export function finalizeResult(
 	};
 }
 
-// ── spawn one worker via `pi -p --mode json` (the proven transport) ───────────
+// ── spawn one worker via `summon -p --mode json` (the proven transport) ───────────
 export function spawnOnce(
 	bundle: AgentBundle,
 	prompt: string,

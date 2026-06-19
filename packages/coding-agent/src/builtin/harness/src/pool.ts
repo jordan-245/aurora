@@ -1,8 +1,8 @@
-// Bounded warm-worker pool — generic, dependency-free. Concrete transports (e.g. an rpc-mode pi
+// Bounded warm-worker pool — generic, dependency-free. Concrete transports (e.g. an rpc-mode summon
 // process) implement PooledWorker. The pool is injected with a WorkerFactory so it stays
 // unit-testable offline.
 
-// A reusable pooled worker. Concrete transports (e.g. an rpc-mode pi process) implement this.
+// A reusable pooled worker. Concrete transports (e.g. an rpc-mode summon process) implement this.
 export interface PooledWorker {
 	readonly id: string;
 	healthy(): boolean; // false → the pool drops it instead of reusing

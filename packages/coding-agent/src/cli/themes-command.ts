@@ -1,7 +1,7 @@
 /**
  * themes-command.ts
  *
- * Implements `pi themes` (list available themes with previews)
+ * Implements `summon themes` (list available themes with previews)
  * and `pi themes <name>` (persist theme selection to settings).
  */
 
@@ -144,7 +144,7 @@ function renderPreview(themeName: string, width: number): string[] {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Run the `pi themes` command.
+ * Run the `summon themes` command.
  *
  * @param args  Remaining args after "themes" (e.g. ["editorial"])
  */
@@ -171,7 +171,7 @@ export async function runThemesCommand(args: string[]): Promise<void> {
 		return;
 	}
 
-	// ── `pi themes` — list all themes with previews ──────────────────────────
+	// ── `summon themes` — list all themes with previews ──────────────────────────
 	const available = getAvailableThemesWithPaths();
 	const width = Math.min(process.stdout.columns ?? 100, 100);
 

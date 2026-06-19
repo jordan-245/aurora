@@ -109,7 +109,7 @@ export function spawnViaPool(bundle: AgentBundle, prompt: string, opts: PoolOpts
 	);
 }
 
-/** Drain + clear all pools (call on session_shutdown so no orphaned pi --mode rpc procs remain). */
+/** Drain + clear all pools (call on session_shutdown so no orphaned summon --mode rpc procs remain). */
 export async function drainAllPools(): Promise<void> {
 	for (const p of POOLS.values()) await p.drain();
 	POOLS.clear();

@@ -1,5 +1,5 @@
 // Harness v2 — Pi extension: registers `spawn_agent` (one task) and `spawn_agents` (parallel fan-out)
-// so an orchestrator pi session can delegate to specialised sub-agents. Project-aware (GLOBAL +
+// so an orchestrator summon session can delegate to specialised sub-agents. Project-aware (GLOBAL +
 // <project>/.summon/agents, .harness.json protected paths). Wraps src/core.ts (single-sourced).
 
 import { execSync } from "node:child_process";
@@ -223,7 +223,7 @@ export default function harness(summon: ExtensionAPI) {
 			transport: Type.Optional(
 				Type.Union([Type.Literal("oneshot"), Type.Literal("pool")], {
 					description:
-						"execution transport: 'oneshot' (default, cold pi -p) or 'pool' (warm pi --mode rpc worker, reused across tasks)",
+						"execution transport: 'oneshot' (default, cold summon -p) or 'pool' (warm summon --mode rpc worker, reused across tasks)",
 				}),
 			),
 		}),

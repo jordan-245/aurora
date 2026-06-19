@@ -1,9 +1,9 @@
 // ContainerWorker — a PooledWorker backed by a real long-lived Docker container.
 //
 // HONEST SCOPE: This delivers the container-ISOLATION primitive (one isolated docker container
-// per pooled worker — the Stripe devbox model). Running the pi agent INSIDE the container is
+// per pooled worker — the Stripe devbox model). Running the summon agent INSIDE the container is
 // the remaining step and is intentionally OUT OF SCOPE here: it needs a prepared image with
-// the pi CLI + Claude OAuth baked in. This module + smoke prove the container lifecycle pools
+// the summon CLI + Claude OAuth baked in. This module + smoke prove the container lifecycle pools
 // correctly with a real container (busybox).
 //
 // Usage:

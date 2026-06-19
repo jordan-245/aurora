@@ -1,4 +1,4 @@
-// RpcWorker — a PooledWorker backed by a long-lived `pi --mode rpc` subprocess.
+// RpcWorker — a PooledWorker backed by a long-lived `summon --mode rpc` subprocess.
 // Implements the PooledWorker contract so WarmPool can manage it.
 // JSONL framing: split on \n only, strip trailing \r — never use node readline.
 import { spawn } from "node:child_process";
@@ -19,7 +19,7 @@ export class RpcWorker implements PooledWorker {
 	private proc: ReturnType<typeof spawn>;
 	private alive = true;
 	private reqId = 0;
-	// Pending id-correlated responses from the pi RPC server
+	// Pending id-correlated responses from the summon RPC server
 	private pendingResponses = new Map<string, { resolve: (r: any) => void; reject: (e: Error) => void }>();
 	// Live event listeners (added/removed by run() lifecycle)
 	private eventHandlers: Array<(ev: any) => void> = [];
@@ -257,7 +257,7 @@ export class RpcWorker implements PooledWorker {
 		return this.alive && !!this.proc.stdin?.writable;
 	}
 
-	/** Terminate the pi process (SIGTERM → SIGKILL after 1s). */
+	/** Terminate the summon process (SIGTERM → SIGKILL after 1s). */
 	destroy(): void {
 		this.alive = false;
 		try {

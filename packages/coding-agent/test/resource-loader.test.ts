@@ -162,8 +162,8 @@ Project skill`,
 			mkdirSync(sharedExtDir, { recursive: true });
 			writeFileSync(
 				join(sharedExtDir, "shared.ts"),
-				`export default function(pi) {
-	pi.registerCommand("shared", {
+				`export default function(summon) {
+	summon.registerCommand("shared", {
 		description: "shared command",
 		handler: async () => {},
 	});
@@ -195,12 +195,12 @@ Project skill`,
 
 			writeFileSync(
 				join(projectExtDir, "project.ts"),
-				`export default function(pi) {
-	pi.registerCommand("deploy", {
+				`export default function(summon) {
+	summon.registerCommand("deploy", {
 		description: "project deploy",
 		handler: async () => {},
 	});
-	pi.registerCommand("project-only", {
+	summon.registerCommand("project-only", {
 		description: "project only",
 		handler: async () => {},
 	});
@@ -209,12 +209,12 @@ Project skill`,
 
 			writeFileSync(
 				join(userExtDir, "user.ts"),
-				`export default function(pi) {
-	pi.registerCommand("deploy", {
+				`export default function(summon) {
+	summon.registerCommand("deploy", {
 		description: "user deploy",
 		handler: async () => {},
 	});
-	pi.registerCommand("user-only", {
+	summon.registerCommand("user-only", {
 		description: "user only",
 		handler: async () => {},
 	});
@@ -541,8 +541,8 @@ Content`,
 				`
 import type { ExtensionAPI } from "@summon/coding-agent";
 import { Type } from "typebox";
-export default function(pi: ExtensionAPI) {
-  pi.registerTool({
+export default function(summon: ExtensionAPI) {
+  summon.registerTool({
     name: "duplicate-tool",
     description: "First",
     parameters: Type.Object({}),
@@ -556,8 +556,8 @@ export default function(pi: ExtensionAPI) {
 				`
 import type { ExtensionAPI } from "@summon/coding-agent";
 import { Type } from "typebox";
-export default function(pi: ExtensionAPI) {
-  pi.registerTool({
+export default function(summon: ExtensionAPI) {
+  summon.registerTool({
     name: "duplicate-tool",
     description: "Second",
     parameters: Type.Object({}),
@@ -583,14 +583,14 @@ export default function(pi: ExtensionAPI) {
 				`
 import type { ExtensionAPI } from "@summon/coding-agent";
 import { Type } from "typebox";
-export default function(pi: ExtensionAPI) {
-  pi.registerTool({
+export default function(summon: ExtensionAPI) {
+  summon.registerTool({
     name: "duplicate-tool",
     description: "global tool",
     parameters: Type.Object({}),
     execute: async () => ({ result: "global" }),
   });
-  pi.registerCommand("deploy", {
+  summon.registerCommand("deploy", {
     description: "global command",
     handler: async () => {},
   });
@@ -602,14 +602,14 @@ export default function(pi: ExtensionAPI) {
 				`
 import type { ExtensionAPI } from "@summon/coding-agent";
 import { Type } from "typebox";
-export default function(pi: ExtensionAPI) {
-  pi.registerTool({
+export default function(summon: ExtensionAPI) {
+  summon.registerTool({
     name: "duplicate-tool",
     description: "explicit tool",
     parameters: Type.Object({}),
     execute: async () => ({ result: "explicit" }),
   });
-  pi.registerCommand("deploy", {
+  summon.registerCommand("deploy", {
     description: "explicit command",
     handler: async () => {},
   });

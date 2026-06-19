@@ -1,5 +1,5 @@
 /**
- * TUI config selector for `pi config` command
+ * TUI config selector for `summon config` command
  */
 
 import { ProcessTerminal, TUI } from "@summon/tui";
