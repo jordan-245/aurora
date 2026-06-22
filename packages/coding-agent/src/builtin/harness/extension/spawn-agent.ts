@@ -15,24 +15,42 @@ import {
 	type BlueprintOutcome,
 	loadBlueprints,
 	type NodeRun,
+	normalizeGeneratedBlueprint,
+	parseBlueprintFromText,
 	runBlueprint,
+	validateBlueprint,
 } from "../src/blueprint.ts";
 import { cacheKey, isCacheable, ResultCache } from "../src/cache.ts";
 import {
+	type AgentBundle,
 	buildSystemPrompt,
 	estimateTokens,
 	isDestructiveCmd,
 	loadRegistries,
 	registryDigest,
+	retryPrompt,
+	runQuorum,
 	runWithReview,
 	spawnAgent,
 	WindowGovernor,
+	withRetry,
 	writeRegistryIndex,
 } from "../src/core.ts";
 import { aggregateFleet, appendFleetEntry, auditPrompt, fleetDigest, readFleet } from "../src/fleet.ts";
+import { type DemandLike, FleetController } from "../src/fleet-controller.ts";
 import { FLEET_LEDGER, FLEET_SUMMARY, REGISTRY_INDEX, RUNS_DIR } from "../src/paths.ts";
-import { drainAllPools, isPrewarmed, pickTransport, prewarm, spawnViaPool } from "../src/pool-transport.ts";
+import {
+	drainAllPools,
+	isPrewarmed,
+	pickTransport,
+	poolStatsAll,
+	prewarm,
+	reapPool,
+	setPoolTarget,
+	spawnViaPool,
+} from "../src/pool-transport.ts";
 import { blueprintResume, listResumableRuns, makeRunId, runEventsPath, runMeta } from "../src/runstore.ts";
+import { resolveScaleMode, scaleLabel, scaleParams } from "../src/scale.ts";
 import { deriveState, RunSession, readEvents } from "../src/session.ts";
 import { loadTeams, runTeam } from "../src/teams.ts";
 
@@ -40,7 +58,18 @@ export default function harness(summon: ExtensionAPI) {
 	const { reg: registry, maxWeight, protectedList, root } = loadRegistries(process.cwd()); // fail-closed validation at load
 	// Window-aware governor: weighted concurrency cap + rolling-window token tracking.
 	// HARNESS_WINDOW_TOKENS>0 turns on a hard window gate; 0 (default) tracks + surfaces only (no hang).
-	const gov = new WindowGovernor({ maxWeight, budgetTokens: Number(process.env.HARNESS_WINDOW_TOKENS ?? 0) });
+	// Scale dial (#4): HARNESS_SCALE=auto|eco|turbo|fixed:N maps the fleet's params at boot. Default
+	// 'auto' == today's behaviour (base maxWeight + the existing window budget), so unset is a no-op.
+	const scaleMode = resolveScaleMode(process.env.HARNESS_SCALE);
+	const scaled = scaleParams(scaleMode, { maxWeight, budgetTokens: Number(process.env.HARNESS_WINDOW_TOKENS ?? 0) });
+	const gov = new WindowGovernor({
+		maxWeight: scaled.maxWeight,
+		budgetTokens: scaled.budgetTokens,
+		// HARNESS_WINDOW_RESERVE=1 makes in-flight reserved (approximate, pre-admission) tokens count
+		// toward the window gate so a burst can't over-commit; default off = admission unchanged.
+		reserveGate: process.env.HARNESS_WINDOW_RESERVE === "1",
+	});
+	let activeScale = scaleMode; // runtime scale dial state (mutated by /harness-scale)
 	const names = [...registry.keys()].filter((n) => n !== "orchestrator").join(", ");
 	// AUTHORITATIVE registry awareness: a compact roster injected into every spawn tool description so the
 	// orchestrator always knows each specialist's tier/tools/contract (never depends on reading a file).
@@ -62,6 +91,11 @@ export default function harness(summon: ExtensionAPI) {
 	// Durable run sessions (Phase 2/3): journal every blueprint/team/fan-out run to an append-only log so
 	// a crashed or human-paused run is discoverable + resumable. HARNESS_DURABLE=0 opts out (journaling off).
 	const DURABLE = process.env.HARNESS_DURABLE !== "0";
+	// Best-of-N cap (#6) and auto-planner caps (#5). All optional; safe defaults.
+	const QUORUM_MAX = Math.max(2, Number(process.env.HARNESS_QUORUM_MAX ?? 3));
+	const PLAN_MAX_NODES = Math.max(1, Number(process.env.HARNESS_PLAN_MAX_NODES ?? 24));
+	const PLAN_FANOUT_CAP = Math.max(1, Number(process.env.HARNESS_PLAN_FANOUT_CAP ?? 20));
+	const PLAN_RUN_ENABLED = process.env.HARNESS_PLAN_RUN === "1"; // default: dry-run only (no execution)
 	// Crash recovery: at boot, surface any run that didn't finish (crashed) or is paused on an approval gate.
 	if (DURABLE) {
 		try {
@@ -130,6 +164,58 @@ export default function harness(summon: ExtensionAPI) {
 			)
 			.catch(() => {});
 	}
+	// ── autoscaler (#3): a demand-driven control loop over the governor + warm pools. Armed only by
+	//    HARNESS_AUTOSCALE=1; observe-only unless HARNESS_AUTOSCALE_ACT=1 (then it resizes pools). With
+	//    both unset the controller is never constructed and runOne behaves byte-for-byte as before. ──
+	const AUTOSCALE = process.env.HARNESS_AUTOSCALE === "1";
+	const AUTOSCALE_ACT = process.env.HARNESS_AUTOSCALE_ACT === "1";
+	// Live per-bundle demand for the controller: inflight = admitted & running; waiting = queued on the
+	// governor. Arrival-rate trend is not yet tracked (0) — computeTarget still sizes to inflight+queued.
+	const inflightByBundle = new Map<string, number>();
+	const waitingByBundle = new Map<string, number>();
+	const bump = (m: Map<string, number>, k: string, d: number) => m.set(k, Math.max(0, (m.get(k) ?? 0) + d));
+	const fleetSignals = (): Map<string, DemandLike> => {
+		const out = new Map<string, DemandLike>();
+		for (const n of new Set([...inflightByBundle.keys(), ...waitingByBundle.keys()]))
+			out.set(n, {
+				bundle: n,
+				inflight: inflightByBundle.get(n) ?? 0,
+				queued: waitingByBundle.get(n) ?? 0,
+				arrivalRate1m: 0,
+				arrivalRateTrend: 0,
+			});
+		return out;
+	};
+	const fleet = AUTOSCALE
+		? new FleetController({
+				gov,
+				registry,
+				actuate: AUTOSCALE_ACT,
+				tickMs: Number(process.env.HARNESS_AUTOSCALE_TICK_MS ?? 2000),
+				maxPerBundle: Number(process.env.HARNESS_AUTOSCALE_MAX ?? Math.max(scaled.poolSize, 16)),
+				shedAtPct: Number(process.env.HARNESS_AUTOSCALE_SHED_PCT ?? 90),
+				signals: fleetSignals,
+				poolStats: () => poolStatsAll().map((p) => ({ name: p.name, total: p.total, idle: p.idle, busy: p.busy })),
+				setPoolTarget: (name, n) => setPoolTarget(name, n),
+				// Shrink: reap idle workers above the pool's min immediately (ttl 0). FleetController ignores
+				// the return; the async reap is fire-and-forget.
+				reapPool: (name, _maxIdle) => {
+					void reapPool(name, 0);
+					return 0;
+				},
+				prewarm: (b) => prewarm([b], { root, protected: protectedList }),
+				onTick: (ticks) =>
+					summon.events?.emit?.("agent-event", {
+						id: "fleet",
+						agent: "harness",
+						ts: Date.now(),
+						t: "autoscale",
+						ticks,
+					}),
+			})
+		: null;
+	fleet?.start();
+
 	const runDir = (ctx: any) => join(tmpdir(), "harness-runs", ctx?.sessionId ?? "session");
 
 	// Start a durable run session (or null when DURABLE is off). The run_started event is self-describing
@@ -164,8 +250,10 @@ export default function harness(summon: ExtensionAPI) {
 		const b = registry.get(agent);
 		if (!b) return { agent, status: "failed", error: `no such agent '${agent}'. have: ${names}` };
 		const emit = (e: any) => summon.events?.emit?.("agent-event", { id: task_id, agent, ts: Date.now(), ...e });
-		// Resolve transport: explicit wins; otherwise a pre-warmed bundle uses its hot pool, else oneshot.
-		const t = transport ?? (isPrewarmed(agent) ? "pool" : "oneshot");
+		// Resolve transport: explicit wins; when the autoscaler is ACTUATING it routes from live saturation,
+		// otherwise a pre-warmed bundle uses its hot pool, else oneshot (observe-only keeps this byte-identical).
+		const t =
+			transport ?? (fleet && AUTOSCALE_ACT ? fleet.routeTransport(b) : isPrewarmed(agent) ? "pool" : "oneshot");
 		const cacheable = !!cache && isCacheable(b);
 		const key = cacheable ? cacheKey(b, prompt, verify) : "";
 		// Fast path: a stored cache hit returns instantly — no governor slot, no spawn, zero token spend.
@@ -177,8 +265,22 @@ export default function harness(summon: ExtensionAPI) {
 				return hit;
 			}
 		}
-		const release = await gov.admit(b);
+		// Reserve an APPROXIMATE pre-admission token estimate (input-only; output bytes unknown until the
+		// spawn completes) — reconciled when release() runs in the finally. The admit hooks surface the
+		// queue/admit transitions on the same agent-event bus the dashboard + autoscaler consume.
+		const reserve = estimateTokens(prompt.length);
+		bump(waitingByBundle, agent, 1); // queued on the governor (autoscaler demand signal)
+		const release = await gov.admit(b, {
+			reserveTokens: reserve,
+			onQueued: (info) =>
+				emit({ t: "queued", queue_depth: info.queueDepth, window_pct: gov.windowPct(), load_pct: gov.loadPct() }),
+			onAdmitted: (info) =>
+				emit({ t: "admitted", waited_ms: info.waitedMs, window_pct: gov.windowPct(), load_pct: gov.loadPct() }),
+		});
+		bump(waitingByBundle, agent, -1);
+		bump(inflightByBundle, agent, 1); // admitted & running
 		emit({ t: "spawned", model: b.model_tier, window_pct: gov.windowPct(), load_pct: gov.loadPct() }); // -> the observability dashboard
+		fleet?.onAgentEvent({ t: "spawned" }); // event-driven scale nudge so a burst doesn't wait a full tick
 		try {
 			const exec = () =>
 				t === "pool"
@@ -218,6 +320,7 @@ export default function harness(summon: ExtensionAPI) {
 			emit({ t: "done", status: "failed" });
 			throw err;
 		} finally {
+			bump(inflightByBundle, agent, -1);
 			release();
 		}
 	}
@@ -253,6 +356,25 @@ export default function harness(summon: ExtensionAPI) {
 			"List each claim you verified.",
 			"## could-not-verify",
 			"List anything you could not check from the diff alone.",
+		].join("\n");
+	}
+
+	// Judge metaprompt for best-of-N: number each surviving candidate so parseQuorumPick can read the pick.
+	function quorumPrompt(task: string, survivors: { artifact_excerpt?: string }[]): string {
+		const cands = survivors
+			.map((s, i) => `## candidate ${i}\n${String(s.artifact_excerpt ?? "").slice(0, 4000)}`)
+			.join("\n\n");
+		return [
+			"ROLE: You are a judge selecting the single best of several independent candidate solutions.",
+			"",
+			"## Original task",
+			task,
+			"",
+			cands,
+			"",
+			"ACCEPTANCE: End your reply with exactly:",
+			"## verdict",
+			"APPROVE candidate <N> — one-line reason (N is the candidate number above).",
 		].join("\n");
 	}
 
@@ -326,6 +448,76 @@ export default function harness(summon: ExtensionAPI) {
 	});
 
 	summon.registerTool({
+		name: "spawn_quorum",
+		label: "Best-of-N: spawn K candidates, verify-filter, judge the winner",
+		description: `Run ONE agent N times in parallel, KEEP only candidates that pass deterministic verify+contract, then pick a winner by majority vote (an LLM judge breaks ties). Turns more attempts into more certainty for high-stakes tasks. N is capped at ${QUORUM_MAX}.\nRegistry: ${digest}`,
+		parameters: Type.Object({
+			agent: Type.String({ description: `one of: ${names}` }),
+			prompt: Type.String({
+				description: "the metaprompt; each candidate additionally gets an independent variant seed",
+			}),
+			n: Type.Optional(
+				Type.Integer({ minimum: 2, description: `candidates to spawn (default 3, capped at ${QUORUM_MAX})` }),
+			),
+			verify: Type.Optional(Type.String({ description: "shell ACCEPTANCE command the harness runs per candidate" })),
+			task_id: Type.Optional(Type.String()),
+			judge: Type.Optional(
+				Type.String({ description: "agent to break ties when candidates diverge (default 'reviewer')" }),
+			),
+		}),
+		async execute(_id: string, p: any, _s: any, _u: any, ctx: any) {
+			if (!registry.has(p.agent))
+				return {
+					content: [{ type: "text", text: `no such agent '${p.agent}'. have: ${names}` }],
+					isError: true,
+					details: undefined,
+				};
+			const taskId = p.task_id ?? `${p.agent}-quorum`;
+			const N = Math.min(QUORUM_MAX, Math.max(2, p.n ?? 3));
+			const judgeAgent = p.judge ?? "reviewer";
+			const { session, runId } = startRun("fanout", "spawn_quorum", { agent: p.agent, n: N }, ctx);
+			const candidates = Array.from(
+				{ length: N },
+				(_v, i) => () =>
+					runOne(
+						p.agent,
+						`${p.prompt}\n\n## VARIANT SEED ${i}\nExplore an independent approach; do not assume other attempts exist.`,
+						`${taskId}#${i}`,
+						ctx,
+						p.verify,
+					),
+			);
+			const judge = async (survivors: { artifact_excerpt?: string }[]) => {
+				if (!registry.has(judgeAgent))
+					return {
+						agent: judgeAgent,
+						status: "failed" as const,
+						artifact_excerpt: "",
+						contract: { passed: false, missing: [] },
+						meta: { model: "", elapsed_s: 0, bytes: 0 },
+					};
+				return runOne(judgeAgent, quorumPrompt(p.prompt, survivors), `${taskId}-judge`, ctx);
+			};
+			const outcome = await runQuorum(candidates, judge, { maxN: N });
+			if (session) {
+				session.append("quorum_decided", {
+					node: taskId,
+					agreement: outcome.agreement,
+					decidedBy: outcome.decidedBy,
+					survivors: outcome.survivors.length,
+					candidates: N,
+					groupSize: outcome.groupSize ?? null,
+				});
+				session.append("run_finished", { status: outcome.winner ? "done" : "failed" });
+			}
+			const text = outcome.winner
+				? `${fmt(outcome.winner)}\n\n=== QUORUM: ${outcome.agreement} via ${outcome.decidedBy} (${outcome.survivors.length}/${N} survived) ===`
+				: `quorum failed — 0/${N} candidates passed verify+contract`;
+			return { content: [{ type: "text", text }], details: { ...outcome, runId }, isError: !outcome.winner };
+		},
+	});
+
+	summon.registerTool({
 		name: "run_team",
 		label: "Run a named team (sequential stages, parallel steps)",
 		description: `Run a named team recipe — stages run sequentially, steps within a stage run in parallel. Available teams are loaded from global + project-local .summon/teams/ directories.`,
@@ -389,6 +581,25 @@ export default function harness(summon: ExtensionAPI) {
 	function blueprintExec(ctx: any): BlueprintExec {
 		return {
 			runAgent: async (agent, prompt, node) => {
+				// best_of (#6): run the node as a quorum — K candidates, verify-filter, judge the winner.
+				if (node.best_of && node.best_of >= 2) {
+					const N = Math.min(QUORUM_MAX, node.best_of);
+					const candidates = Array.from(
+						{ length: N },
+						(_v, i) => () =>
+							runOne(
+								agent,
+								`${prompt}\n\n## VARIANT SEED ${i}\nExplore an independent approach; do not assume other attempts exist.`,
+								`${node.id}#${i}`,
+								ctx,
+								node.verify,
+							),
+					);
+					const judge = (survivors: { artifact_excerpt?: string }[]) =>
+						runOne("reviewer", quorumPrompt(prompt, survivors), `${node.id}-judge`, ctx);
+					const outcome = await runQuorum(candidates, judge, { maxN: N });
+					return { ok: !!outcome.winner, output: outcome.winner?.artifact_excerpt ?? "", result: outcome };
+				}
 				const r = await runOne(agent, prompt, node.id, ctx, node.verify);
 				return { ok: r.status === "done", output: r.artifact_excerpt ?? "", result: r };
 			},
@@ -527,6 +738,147 @@ export default function harness(summon: ExtensionAPI) {
 		},
 	});
 
+	// ── auto-planner (#5): synthesize a validated, runnable blueprint DAG from a goal ────────────────
+	// A frontier, read-only, no-delegation planner that can never write JSON to disk or spawn workers.
+	function makePlannerBundle(): AgentBundle {
+		return {
+			name: "auto-planner",
+			role: "decompose a goal into a validated blueprint DAG",
+			model_tier: "frontier",
+			tools: ["read", "grep", "find", "ls"],
+			output_contract: { required_sections: ["```json"] },
+			max_attempts: 1, // the OUTER withRetry owns the parse/validate retry
+			timeout_s: 600,
+		};
+	}
+	function planPrompt(goal: string, vars: Record<string, string> | undefined, prev?: any): string {
+		const base = [
+			"ROLE: You are an orchestration planner. Decompose the GOAL into a blueprint DAG of CODE nodes",
+			"(deterministic shell the harness runs itself) and AGENT nodes (scoped specialists).",
+			"",
+			`## Goal\n${goal}`,
+			vars && Object.keys(vars).length ? `\n## Vars\n${JSON.stringify(vars)}` : "",
+			"",
+			`## Available specialist agents (use ONLY these as a node's "agent")\n${digest}`,
+			"",
+			"## Output contract",
+			"Emit ONLY the blueprint as the LAST fenced ```json block, with nothing after it. Schema:",
+			'{ "name": string, "description"?: string, "nodes": [ { "id": string, "depends_on"?: string[],',
+			'  EITHER "run": string (a non-destructive shell command) OR "agent": string + "prompt": string,',
+			'  "verify"?: string, "fan_out_from"?: string, "fan_out_limit"?: number } ] }',
+			`Rules: unique ids; acyclic; at most ${PLAN_MAX_NODES} nodes; each node is EITHER code OR agent (never both);`,
+			"agent ids must be in the roster above and never a delegation agent; reference upstream output only via",
+			"{{node.<id>}} for a declared depends_on.",
+		].join("\n");
+		return prev ? retryPrompt(base, prev) : base;
+	}
+	function renderGeneratedPlan(bp: Blueprint, notes: string[]): string {
+		const lines = bp.nodes.map((n) => {
+			const kind = n.run !== undefined ? "code" : `agent:${n.agent}`;
+			const deps = (n.depends_on ?? []).length ? ` depends_on=[${(n.depends_on ?? []).join(",")}]` : "";
+			const gate = n.requires_approval ? " [approval]" : "";
+			return `  - ${n.id} [${kind}]${deps}${gate}`;
+		});
+		return [
+			`PLAN: ${bp.name} (${bp.nodes.length} nodes, dry run)`,
+			...lines,
+			...(notes.length ? ["", "notes:", ...notes.map((x) => `  - ${x}`)] : []),
+		].join("\n");
+	}
+	async function planAndRun(
+		goal: string,
+		vars: Record<string, string> | undefined,
+		ctx: any,
+		dryRun: boolean,
+	): Promise<{ content: { type: "text"; text: string }[]; details: unknown; isError: boolean }> {
+		const planner = makePlannerBundle();
+		// Holder (not a closure-mutated `let`) so the validated DAG narrows cleanly after withRetry.
+		const holder: { bp: Blueprint | null; notes: string[] } = { bp: null, notes: [] };
+		// OUTER retry: spawn the planner, parse + normalize + validate; feed the validator error back on a miss.
+		const result = await withRetry(2, async (_attempt, prev) => {
+			const r = await spawnAgent(planner, planPrompt(goal, vars, prev), {
+				runDir: runDir(ctx),
+				taskId: "auto-planner",
+				protected: protectedList,
+				root,
+			});
+			const parsed = parseBlueprintFromText(r.artifact_excerpt ?? "");
+			if (parsed.error)
+				return { ...r, status: "contract_violation", contract: { passed: false, missing: [parsed.error] } };
+			try {
+				const norm = normalizeGeneratedBlueprint(parsed.bp!, {
+					maxNodes: PLAN_MAX_NODES,
+					fanOutCap: PLAN_FANOUT_CAP,
+					forceApprovalOnWrite: true, // every CODE node must be approved before it can run
+				});
+				validateBlueprint(norm.bp, registry); // the EXISTING fail-closed gate
+				holder.bp = norm.bp;
+				holder.notes = norm.notes;
+			} catch (e) {
+				return {
+					...r,
+					status: "contract_violation",
+					contract: { passed: false, missing: [e instanceof Error ? e.message : String(e)] },
+				};
+			}
+			return { ...r, status: "done" };
+		});
+		const bp = holder.bp;
+		if (!bp)
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `plan_and_run: planner did not produce a valid blueprint\n\n${(result.artifact_excerpt ?? "").slice(0, 1500)}`,
+					},
+				],
+				details: result,
+				isError: true,
+			};
+		if (dryRun)
+			return {
+				content: [{ type: "text" as const, text: renderGeneratedPlan(bp, holder.notes) }],
+				details: { blueprint: bp, notes: holder.notes },
+				isError: false,
+			};
+		const { session, runId } = startRun("blueprint", bp.name, { vars: vars ?? {}, generated: true }, ctx);
+		const outcome = await executeBlueprint(bp, vars ?? {}, ctx, session);
+		const failed = outcome.nodes.some((n) => n.status === "failed" || n.status === "skipped");
+		return {
+			content: [{ type: "text" as const, text: renderBlueprint(outcome, runId) }],
+			details: { ...outcome, runId },
+			isError: failed && !outcome.paused,
+		};
+	}
+
+	summon.registerTool({
+		name: "plan_and_run",
+		label: "Plan a DAG from a goal and (optionally) run it",
+		description: `Synthesise a structurally-validated blueprint DAG from a natural-language GOAL using the frontier planner, then ${PLAN_RUN_ENABLED ? "run it inline" : "return the plan (execution disabled — set HARNESS_PLAN_RUN=1)"}. dry_run:true always returns the validated DAG without executing.\nRegistry: ${digest}`,
+		parameters: Type.Object({
+			goal: Type.String({ description: "the goal to decompose into a DAG" }),
+			vars: Type.Optional(Type.Record(Type.String(), Type.String())),
+			dry_run: Type.Optional(
+				Type.Boolean({
+					description: "return the validated DAG without executing (forced true unless HARNESS_PLAN_RUN=1)",
+				}),
+			),
+		}),
+		async execute(_id: string, p: any, _s: any, _u: any, ctx: any) {
+			const dry = p.dry_run === true || !PLAN_RUN_ENABLED;
+			try {
+				return await planAndRun(p.goal, p.vars, ctx, dry);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{ type: "text", text: `plan_and_run failed: ${msg}` }],
+					isError: true,
+					details: undefined,
+				};
+			}
+		},
+	});
+
 	summon.registerTool({
 		name: "resume_run",
 		label: "Resume a durable run (crashed or approval-paused)",
@@ -634,8 +986,38 @@ export default function harness(summon: ExtensionAPI) {
 		},
 	});
 
+	// Scale dial (#4): retune the live concurrency cap (and the autoscaler's per-bundle ceiling) at runtime.
+	summon.registerCommand?.("harness-scale", {
+		description:
+			"Scale dial: show | auto | eco | turbo | fixed:N — retune the live concurrency cap + autoscaler ceiling.",
+		handler: async (args: string, ctx: any) => {
+			const a = (args ?? "").trim();
+			if (!a || a === "show") {
+				ctx?.ui?.notify?.(`harness scale: ${scaleLabel(activeScale)} — maxWeight ${gov.maxWeightCap()}`, "info");
+				return;
+			}
+			activeScale = resolveScaleMode(a);
+			const params = scaleParams(activeScale, {
+				maxWeight,
+				budgetTokens: Number(process.env.HARNESS_WINDOW_TOKENS ?? 0),
+			});
+			gov.setMaxWeight(params.maxWeight);
+			fleet?.setMaxPerBundle(Math.max(params.poolSize, params.maxWeight));
+			summon.events?.emit?.("agent-event", {
+				id: "fleet",
+				agent: "harness",
+				ts: Date.now(),
+				t: "scaling",
+				window_pct: gov.windowPct(),
+				load_pct: gov.loadPct(),
+			});
+			ctx?.ui?.notify?.(`harness scale → ${scaleLabel(activeScale)} (maxWeight ${gov.maxWeightCap()})`, "info");
+		},
+	});
+
 	// On shutdown: drain warm pools (no orphaned rpc procs) and write the cross-run fleet digest (#8).
 	summon.on?.("session_shutdown", async () => {
+		fleet?.stop();
 		await drainAllPools();
 		try {
 			writeFileSync(FLEET_SUMMARY, fleetDigest(aggregateFleet(readFleet(FLEET_LEDGER))));

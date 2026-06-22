@@ -34,6 +34,10 @@ export interface BlueprintNode {
 	// node's output is the joined child outputs; it is `done` iff every child succeeded.
 	fan_out_from?: string;
 	fan_out_limit?: number; // cap on items (default 20) — bounds blast radius / token spend
+	// BEST-OF-N (#6): spawn this agent node K times, keep only candidates that passed deterministic
+	// verify+contract, pick a winner by majority vote (judge fallback). XOR with fan_out_from — a quorum
+	// node runs ONE prompt K times; a fan-out node runs K DIFFERENT prompts once.
+	best_of?: number;
 }
 export interface Blueprint {
 	name: string;
@@ -62,6 +66,92 @@ export function fanOutItems(upstream: string, limit = FANOUT_DEFAULT_LIMIT): str
 		if (items.length >= Math.max(1, limit)) break;
 	}
 	return items;
+}
+
+// ── generated-blueprint helpers (auto-planner #5): parse + normalize a model-emitted DAG ──────────
+// Extract the LAST fenced ```json block (the planner contract: the blueprint is its final output),
+// falling back to the last balanced top-level {...} object so a planner that forgets the fence still
+// works. String-aware so braces inside double-quoted strings never unbalance the scan. null if none.
+export function extractLastJsonBlock(text: string): string | null {
+	const src = text ?? "";
+	const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
+	let last: string | null = null;
+	for (let m = fence.exec(src); m; m = fence.exec(src)) {
+		const body = m[1].trim();
+		if (body) last = body;
+	}
+	if (last) return last;
+	// fallback: scan for the last balanced top-level {...}, ignoring braces inside double-quoted strings.
+	let depth = 0;
+	let start = -1;
+	let inStr = false;
+	let esc = false;
+	let best: string | null = null;
+	for (let i = 0; i < src.length; i++) {
+		const ch = src[i];
+		if (inStr) {
+			if (esc) esc = false;
+			else if (ch === "\\") esc = true;
+			else if (ch === '"') inStr = false;
+			continue;
+		}
+		if (ch === '"') inStr = true;
+		else if (ch === "{") {
+			if (depth === 0) start = i;
+			depth++;
+		} else if (ch === "}" && depth > 0) {
+			depth--;
+			if (depth === 0 && start >= 0) best = src.slice(start, i + 1);
+		}
+	}
+	return best;
+}
+
+// Parse-only (stays pure: the registry-aware validation is the caller's separate step via
+// validateBlueprint). Returns the object or a human-readable error — never throws on bad input.
+export function parseBlueprintFromText(text: string): { bp?: Blueprint; error?: string } {
+	const body = extractLastJsonBlock(text);
+	if (!body) return { error: "no ```json blueprint block found in planner output" };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(body);
+	} catch (e) {
+		return { error: `blueprint JSON parse failed: ${e instanceof Error ? e.message : String(e)}` };
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+		return { error: "blueprint must be a JSON object" };
+	return { bp: parsed as Blueprint };
+}
+
+export interface NormalizeOpts {
+	maxNodes: number;
+	fanOutCap: number;
+	forceApprovalOnWrite: boolean;
+}
+// Pre-validation hardening of a model-generated blueprint: reject oversized DAGs, clamp every node's
+// fan-out limit, and (optionally) force an approval gate on every CODE node — the only place the harness
+// itself runs shell. Returns a fresh clone (never mutates the caller's object) plus human-readable notes.
+export function normalizeGeneratedBlueprint(bp: Blueprint, opts: NormalizeOpts): { bp: Blueprint; notes: string[] } {
+	const notes: string[] = [];
+	const nodes = Array.isArray(bp.nodes) ? bp.nodes : [];
+	if (nodes.length > opts.maxNodes)
+		throw new Error(`generated blueprint exceeds node cap: ${nodes.length} > ${opts.maxNodes}`);
+	const cloned = nodes.map((n) => {
+		const copy: BlueprintNode = { ...n };
+		if (copy.depends_on) copy.depends_on = [...copy.depends_on];
+		if (copy.fan_out_limit !== undefined) {
+			const clamped = Math.min(copy.fan_out_limit, opts.fanOutCap);
+			if (clamped !== copy.fan_out_limit)
+				notes.push(`node '${copy.id}': fan_out_limit ${copy.fan_out_limit} -> ${clamped}`);
+			copy.fan_out_limit = clamped;
+		}
+		if (opts.forceApprovalOnWrite && nodeKind(copy) === "code" && !copy.requires_approval) {
+			copy.requires_approval = true;
+			notes.push(`node '${copy.id}': code node force-gated requires_approval`);
+		}
+		return copy;
+	});
+	return { bp: { ...bp, nodes: cloned }, notes };
 }
 
 // What an injected executor returns for one node. `output` is exposed downstream as {{node.<id>}}.
@@ -138,6 +228,11 @@ export function validateBlueprint(bp: Blueprint, registry: Map<string, AgentBund
 					err(`node '${n.id}': fan_out_from must be a non-empty node id`);
 				if (!(n.depends_on ?? []).includes(n.fan_out_from))
 					err(`node '${n.id}': fan_out_from '${n.fan_out_from}' must also be in depends_on`);
+			}
+			if (n.best_of !== undefined) {
+				if (typeof n.best_of !== "number" || !Number.isInteger(n.best_of) || n.best_of < 2)
+					err(`node '${n.id}': best_of must be an integer >= 2`);
+				if (n.fan_out_from !== undefined) err(`node '${n.id}': best_of and fan_out_from are mutually exclusive`);
 			}
 		}
 	}

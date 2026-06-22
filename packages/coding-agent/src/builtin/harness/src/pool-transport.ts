@@ -7,7 +7,7 @@
 //                                                                   ↑ only the extension
 //                                                                     imports this module
 import { type AgentBundle, finalizeResult, MODEL, retryPrompt, type SpawnResult, withRetry } from "./core.ts";
-import { WarmPool } from "./pool.ts";
+import { type PoolStats, WarmPool } from "./pool.ts";
 import { RpcWorker } from "./rpc-worker.ts";
 
 export interface PoolOpts {
@@ -23,6 +23,15 @@ export interface PoolOpts {
 // Module-level registry: one warm pool per bundle name, created lazily on first poolFor() call.
 const POOLS = new Map<string, WarmPool<RpcWorker>>();
 const POOL_SIZE = Math.max(1, Number(process.env.HARNESS_POOL_SIZE ?? 4));
+
+// Elastic band from env. HARNESS_POOL_SIZE remains the default for both min and max so an unset env
+// is identical to the pre-elastic fixed pool; HARNESS_POOL_MIN/MAX widen the band when set.
+export const poolBand = (): { min: number; max: number } => {
+	const cap = Math.max(1, Number(process.env.HARNESS_POOL_SIZE ?? 4));
+	const max = Math.max(1, Number(process.env.HARNESS_POOL_MAX ?? cap));
+	const min = Math.max(0, Math.min(Number(process.env.HARNESS_POOL_MIN ?? cap), max));
+	return { min, max };
+};
 
 // Bundles whose pool has been PRE-WARMED (standing idle rpc workers, cold-start tax pre-paid).
 // Once a bundle is pre-warmed the adaptive batch threshold no longer applies — the pool wins at any
@@ -56,7 +65,10 @@ export async function prewarm(
 	for (const b of bundles) {
 		const pool = poolFor(b, { root: opts.root, protected: opts.protected });
 		try {
-			await pool.warm(opts.size ?? POOL_SIZE);
+			const warmed = opts.size ?? POOL_SIZE;
+			await pool.warm(warmed);
+			// Raise target to the warmed count so prewarmed workers sit at/below target (not reapable).
+			pool.setTarget(warmed);
 			PREWARMED.add(b.name);
 			const s = pool.stats();
 			out.push({ name: b.name, total: s.total, idle: s.idle });
@@ -76,9 +88,11 @@ export async function prewarm(
 export function poolFor(bundle: AgentBundle, opts: PoolOpts = {}): WarmPool<RpcWorker> {
 	let p = POOLS.get(bundle.name);
 	if (!p) {
+		const band = poolBand();
 		p = new WarmPool<RpcWorker>(
 			{ create: () => RpcWorker.start(bundle, { root: opts.root, protected: opts.protected }) },
-			{ size: POOL_SIZE },
+			// Start target at min — the pool grows on demand (acquire pressure) up to max.
+			{ min: band.min, max: band.max, target: band.min },
 		);
 		POOLS.set(bundle.name, p);
 	}
@@ -114,6 +128,40 @@ export async function drainAllPools(): Promise<void> {
 	for (const p of POOLS.values()) await p.drain();
 	POOLS.clear();
 	PREWARMED.clear();
+}
+
+// ── Autoscaler control seams ──────────────────────────────────────────────────
+// These let an external controller observe pressure (poolStatsAll) and drive the band: nudge a
+// pool's target up under load (setPoolTarget) and shrink idle workers back down (reapPool /
+// reapAllPools). All operate over the live POOLS registry, mirroring drainAllPools' iteration.
+
+/** Per-pool snapshot for every registered pool (name + full PoolStats: total/idle/busy/min/max/target/waiting). */
+export function poolStatsAll(): Array<{ name: string } & PoolStats> {
+	const out: Array<{ name: string } & PoolStats> = [];
+	for (const [name, p] of POOLS) out.push({ name, ...p.stats() });
+	return out;
+}
+
+/** Set one pool's target (clamped into its [min,max]). Returns false if no pool by that name. */
+export function setPoolTarget(name: string, n: number): boolean {
+	const p = POOLS.get(name);
+	if (!p) return false;
+	p.setTarget(n);
+	return true;
+}
+
+/**
+ * Reap one pool's idle workers idle for ≥ `ttlMs`, down to its `min`. `ttlMs=0` reaps every idle
+ * worker above min immediately. Resolves to the number reaped (0 if no pool by that name).
+ */
+export function reapPool(name: string, ttlMs: number): Promise<number> {
+	const p = POOLS.get(name);
+	return p ? p.reapIdle(Date.now(), ttlMs) : Promise.resolve(0);
+}
+
+/** Reap idle workers older than `ttlMs` across every pool. Returns the per-pool reaped counts. */
+export function reapAllPools(now: number, ttlMs: number): Promise<number[]> {
+	return Promise.all([...POOLS.values()].map((p) => p.reapIdle(now, ttlMs)));
 }
 
 /** Test seam — number of registered pools (drained pools are removed). */

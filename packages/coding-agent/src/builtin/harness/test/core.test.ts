@@ -12,6 +12,7 @@ import {
 	assertSpawnAuth,
 	buildSystemPrompt,
 	buildWorkerArgs,
+	candidateKey,
 	checkContract,
 	estimateTokens,
 	finalizeResult,
@@ -20,15 +21,18 @@ import {
 	loadExpertiseMemory,
 	loadRegistry,
 	parseExpertiseNote,
+	parseQuorumPick,
 	parseVerdict,
 	registryDigest,
 	registryIndex,
 	registryView,
 	reviewDecision,
+	runQuorum,
 	runWithReview,
 	type SpawnResult,
 	SYS_HEADER,
 	spawnEnv,
+	tallyQuorum,
 	validateBundle,
 	WindowGovernor,
 	WORKER_SEAL_FLAGS,
@@ -387,6 +391,140 @@ test("runWithReview: enabled=false + build done → review not called, approved 
 	assert.equal(outcome.review, undefined);
 });
 
+// ── runQuorum / best-of-N tests (frozen, inject fakes — no subprocess) ───────────────
+const mkText = (status: SpawnResult["status"], text: string): SpawnResult => ({
+	...mk(status),
+	artifact_excerpt: text,
+});
+
+test("runQuorum: unanimous done candidates → majority via vote; judge not called", async () => {
+	let judged = false;
+	const out = await runQuorum(
+		[
+			() => Promise.resolve(mkText("done", "SAME")),
+			() => Promise.resolve(mkText("done", "SAME")),
+			() => Promise.resolve(mkText("done", "SAME")),
+		],
+		async () => {
+			judged = true;
+			return mk("done");
+		},
+	);
+	assert.equal(out.agreement, "majority");
+	assert.equal(out.decidedBy, "vote");
+	assert.equal(out.groupSize, 3);
+	assert.equal(out.winner?.artifact_excerpt, "SAME");
+	assert.equal(judged, false);
+});
+
+test("runQuorum: 2-of-3 identical done → strict survivor majority wins by vote", async () => {
+	let judged = false;
+	const out = await runQuorum(
+		[
+			() => Promise.resolve(mkText("done", "A")),
+			() => Promise.resolve(mkText("done", "A")),
+			() => Promise.resolve(mkText("done", "B")),
+		],
+		async () => {
+			judged = true;
+			return mk("done");
+		},
+	);
+	assert.equal(out.winner?.artifact_excerpt, "A");
+	assert.equal(out.agreement, "majority");
+	assert.equal(judged, false, "2 > 3/2 → decided by vote, judge not called");
+});
+
+test("runQuorum: verify_failed / contract_violation / failed candidates are filtered before the vote", async () => {
+	const out = await runQuorum(
+		[
+			() => Promise.resolve(mkText("verify_failed", "X")),
+			() => Promise.resolve(mk("contract_violation")),
+			() => Promise.resolve(mkText("done", "OK")),
+		],
+		async () => mk("done"),
+	);
+	assert.equal(out.survivors.length, 1);
+	assert.equal(out.winner?.artifact_excerpt, "OK");
+	assert.equal(out.agreement, "majority");
+});
+
+test("runQuorum: no majority among distinct survivors → judge called, parses the pick", async () => {
+	const out = await runQuorum(
+		[() => Promise.resolve(mkText("done", "A")), () => Promise.resolve(mkText("done", "B"))],
+		async () => mkText("done", "## verdict\nAPPROVE candidate 1"),
+	);
+	assert.equal(out.decidedBy, "judge");
+	assert.equal(out.agreement, "judged");
+	assert.equal(out.winner?.artifact_excerpt, "B");
+	assert.ok(out.judge, "judge result is surfaced");
+});
+
+test("runQuorum: judge verdict unparseable → fail-SAFE to the first survivor", async () => {
+	const out = await runQuorum(
+		[() => Promise.resolve(mkText("done", "A")), () => Promise.resolve(mkText("done", "B"))],
+		async () => mkText("done", "meh, no idea"),
+	);
+	assert.equal(out.decidedBy, "judge");
+	assert.equal(out.winner?.artifact_excerpt, "A", "fail-safe to survivors[0] when the verdict can't be parsed");
+});
+
+test("runQuorum: all candidates fail → no winner, agreement none, judge not called", async () => {
+	let judged = false;
+	const out = await runQuorum(
+		[() => Promise.resolve(mk("failed")), () => Promise.resolve(mk("verify_failed"))],
+		async () => {
+			judged = true;
+			return mk("done");
+		},
+	);
+	assert.equal(out.winner, undefined);
+	assert.equal(out.agreement, "none");
+	assert.equal(out.decidedBy, "no-survivor");
+	assert.equal(judged, false);
+});
+
+test("runQuorum: a candidate closure that throws is captured as failed, not rethrown", async () => {
+	const out = await runQuorum(
+		[() => Promise.reject(new Error("boom")), () => Promise.resolve(mkText("done", "OK"))],
+		async () => mk("done"),
+	);
+	assert.equal(out.survivors.length, 1);
+	assert.equal(out.winner?.artifact_excerpt, "OK");
+});
+
+test("runQuorum: maxN caps how many candidate closures are invoked", async () => {
+	let calls = 0;
+	const make = () => () => {
+		calls++;
+		return Promise.resolve(mk("done"));
+	};
+	await runQuorum([make(), make(), make(), make(), make()], async () => mk("done"), { maxN: 3 });
+	assert.equal(calls, 3);
+});
+
+test("parseQuorumPick: bounds-checks the index and reads candidate/# forms", () => {
+	assert.equal(parseQuorumPick("## verdict\nAPPROVE candidate 9", 3), undefined);
+	assert.equal(parseQuorumPick("## verdict\nAPPROVE #1", 3), 1);
+	assert.equal(parseQuorumPick("## verdict\nAPPROVE candidate 0", 3), 0);
+});
+
+test("candidateKey: collapses whitespace so formatting-only differences vote together", () => {
+	assert.equal(candidateKey(mkText("done", "a   b\n c")), candidateKey(mkText("done", "a b c")));
+});
+
+test("tallyQuorum: survivors are status===done, grouped by candidateKey", () => {
+	const { groups, survivors } = tallyQuorum([
+		mkText("done", "A"),
+		mkText("done", "A"),
+		mkText("failed", "A"),
+		mkText("done", "B"),
+	]);
+	assert.equal(survivors.length, 3);
+	assert.equal(groups.get("A")?.length, 2);
+	assert.equal(groups.get("B")?.length, 1);
+});
+
 // ── buildSystemPrompt tests ────────────────────────────────────────────────────────
 test("buildSystemPrompt: includes header, role, and contract sections", () => {
 	// base has no context_globs → no expertise block
@@ -609,6 +747,118 @@ test("WindowGovernor hard-gates admit when the token budget is exhausted", async
 	});
 	await new Promise((r) => setTimeout(r, 250));
 	assert.equal(admitted, false, "admit must queue while the window budget is exhausted");
+});
+
+test("WindowGovernor exposes queue depth and oldest-wait latency with an injected clock (FIFO order)", async () => {
+	let t = 1000;
+	const gov = new WindowGovernor({ maxWeight: 4, now: () => t });
+	const fast: AgentBundle = { ...base, model_tier: "fast" }; // weight 1
+	const frontier: AgentBundle = { ...base, model_tier: "frontier" }; // weight 4
+	const relFrontier = await gov.admit(frontier); // fills the whole budget
+	assert.equal(gov.queueDepth(), 0);
+	const queuedDepths: number[] = [];
+	const admittedOrder: number[] = [];
+	const p1 = gov.admit(fast, {
+		onQueued: (i) => queuedDepths.push(i.queueDepth),
+		onAdmitted: () => admittedOrder.push(1),
+	});
+	const p2 = gov.admit(fast, {
+		onQueued: (i) => queuedDepths.push(i.queueDepth),
+		onAdmitted: () => admittedOrder.push(2),
+	});
+	assert.equal(gov.queueDepth(), 2);
+	assert.deepEqual(queuedDepths, [1, 2], "onQueued reports the depth at enqueue");
+	t += 500;
+	assert.equal(gov.oldestWaitMs(), 500, "oldest waiter (FIFO front) has waited 500ms on the injected clock");
+	relFrontier();
+	await Promise.all([p1, p2]);
+	assert.equal(gov.queueDepth(), 0);
+	assert.deepEqual(admittedOrder, [1, 2], "waiters are admitted in FIFO order");
+});
+
+test("WindowGovernor onAdmitted reports waited_ms measured by the injected clock", async () => {
+	let t = 1000;
+	const gov = new WindowGovernor({ maxWeight: 1, now: () => t });
+	const fast: AgentBundle = { ...base, model_tier: "fast" };
+	const rel = await gov.admit(fast); // fills maxWeight 1
+	let waited = -1;
+	const pending = gov.admit(fast, {
+		onAdmitted: (i) => {
+			waited = i.waitedMs;
+		},
+	});
+	t = 1700;
+	rel();
+	await pending;
+	assert.equal(waited, 700);
+});
+
+test("WindowGovernor reserves tokens at admit and reconciles on release; reserveGate gates admission", async () => {
+	const fast: AgentBundle = { ...base, model_tier: "fast" };
+
+	// Surfacing only (no budget): reserved tokens are tracked and reconciled on release.
+	const gov = new WindowGovernor({ maxWeight: 8 });
+	const rel = await gov.admit(fast, { reserveTokens: 250 });
+	assert.equal(gov.reservedTokens(), 250);
+	rel();
+	assert.equal(gov.reservedTokens(), 0);
+
+	// reserveGate ON: reserved tokens count toward the window budget gate.
+	const gated = new WindowGovernor({ maxWeight: 8, budgetTokens: 300, reserveGate: true });
+	const r1 = await gated.admit(fast, { reserveTokens: 200 }); // 0 + 200 < 300 -> admits
+	assert.equal(gated.reservedTokens(), 200);
+	let secondAdmitted = false;
+	gated.admit(fast, { reserveTokens: 200 }).then(() => {
+		secondAdmitted = true;
+	}); // 200 + 200 >= 300 -> must queue
+	await new Promise((r) => setTimeout(r, 50));
+	assert.equal(secondAdmitted, false, "reserveGate blocks the second admit once reserved would exceed budget");
+	r1(); // frees 200 reserved -> pump admits the waiter
+	await new Promise((r) => setTimeout(r, 50));
+	assert.equal(secondAdmitted, true);
+
+	// reserveGate OFF (default): reserved tokens are surfaced but never gate admission.
+	const ungated = new WindowGovernor({ maxWeight: 8, budgetTokens: 300 });
+	await ungated.admit(fast, { reserveTokens: 200 });
+	let admitted = false;
+	await ungated.admit(fast, { reserveTokens: 200 }).then(() => {
+		admitted = true;
+	});
+	assert.equal(admitted, true, "default reserveGate=off ignores reserved tokens for admission");
+});
+
+test("WindowGovernor headroom and inUseWeight reflect weighted occupancy", async () => {
+	const gov = new WindowGovernor({ maxWeight: 8 });
+	assert.equal(gov.headroom(), 8);
+	assert.equal(gov.inUseWeight(), 0);
+	const relF = await gov.admit({ ...base, model_tier: "frontier" }); // weight 4
+	assert.equal(gov.inUseWeight(), 4);
+	assert.equal(gov.headroom(), 4);
+	const relFast = await gov.admit({ ...base, model_tier: "fast" }); // weight 1
+	assert.equal(gov.inUseWeight(), 5);
+	assert.equal(gov.headroom(), 3);
+	relF();
+	relFast();
+	assert.equal(gov.headroom(), 8);
+	assert.equal(gov.inUseWeight(), 0);
+});
+
+test("WindowGovernor setMaxWeight resizes the cap and wakes a now-fitting waiter", async () => {
+	const gov = new WindowGovernor({ maxWeight: 1 });
+	const fast: AgentBundle = { ...base, model_tier: "fast" };
+	const rel = await gov.admit(fast); // fills cap 1
+	let admitted = false;
+	const pending = gov.admit(fast).then((r) => {
+		admitted = true;
+		return r;
+	});
+	await new Promise((r) => setTimeout(r, 20));
+	assert.equal(admitted, false, "second admit queues at cap 1");
+	gov.setMaxWeight(2); // raise the cap -> the waiter now fits and is woken
+	await pending;
+	assert.equal(admitted, true);
+	assert.equal(gov.maxWeightCap(), 2);
+	rel();
 });
 
 // ── registry index + digest ─────────────────────────────────────────────────────

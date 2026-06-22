@@ -9,9 +9,12 @@ import { test } from "node:test";
 import {
 	type Blueprint,
 	type BlueprintExec,
+	extractLastJsonBlock,
 	fanOutItems,
 	loadBlueprints,
 	type NodeRun,
+	normalizeGeneratedBlueprint,
+	parseBlueprintFromText,
 	runBlueprint,
 	validateBlueprint,
 } from "../src/blueprint.ts";
@@ -389,5 +392,117 @@ test("fan_out node fails if any child fails; validation requires fan_out_from in
 				reg2,
 			),
 		/must also be in depends_on/,
+	);
+});
+
+// ── best_of / quorum node validation (#6) ───────────────────────────────────────
+
+test("validateBlueprint: best_of < 2 is rejected", () => {
+	const bp: Blueprint = { name: "b", nodes: [{ id: "q", agent: "scout", prompt: "p", best_of: 1 }] };
+	assert.throws(() => validateBlueprint(bp, reg), /best_of must be an integer >= 2/);
+});
+
+test("validateBlueprint: best_of and fan_out_from are mutually exclusive", () => {
+	const bp: Blueprint = {
+		name: "b",
+		nodes: [
+			{ id: "list", run: "ls" },
+			{ id: "q", agent: "scout", prompt: "p", best_of: 3, fan_out_from: "list", depends_on: ["list"] },
+		],
+	};
+	assert.throws(() => validateBlueprint(bp, reg), /mutually exclusive/);
+});
+
+test("validateBlueprint: best_of:3 on a valid agent node passes", () => {
+	const bp: Blueprint = { name: "b", nodes: [{ id: "q", agent: "scout", prompt: "p", best_of: 3 }] };
+	assert.doesNotThrow(() => validateBlueprint(bp, reg));
+});
+
+// ── generated-blueprint helpers (auto-planner #5) ───────────────────────────────
+
+test("extractLastJsonBlock returns the LAST fenced json block", () => {
+	const text = 'first ```json\n{"a":1}\n``` then ```json\n{"b":2}\n```';
+	assert.equal(extractLastJsonBlock(text), '{"b":2}');
+});
+
+test("extractLastJsonBlock falls back to the last balanced object, brace-in-string safe", () => {
+	const text = 'prose {"name":"x","s":"a } b","nodes":[{"id":"n"}]} trailing';
+	assert.equal(extractLastJsonBlock(text), '{"name":"x","s":"a } b","nodes":[{"id":"n"}]}');
+});
+
+test("extractLastJsonBlock returns null when there is no json", () => {
+	assert.equal(extractLastJsonBlock("just prose, no braces"), null);
+});
+
+test("parseBlueprintFromText surfaces a parse error", () => {
+	const r = parseBlueprintFromText("```json\n{bad,}\n```");
+	assert.ok(r.error && /parse failed/.test(r.error));
+	assert.equal(r.bp, undefined);
+});
+
+test("parseBlueprintFromText rejects a non-object (array)", () => {
+	const r = parseBlueprintFromText("```json\n[1,2]\n```");
+	assert.ok(r.error && /must be a JSON object/.test(r.error));
+});
+
+test("parseBlueprintFromText returns a Blueprint that validateBlueprint accepts", () => {
+	const r = parseBlueprintFromText('```json\n{"name":"g","nodes":[{"id":"a","agent":"scout","prompt":"x"}]}\n```');
+	assert.ok(r.bp);
+	assert.doesNotThrow(() => validateBlueprint(r.bp!, reg));
+});
+
+test("normalizeGeneratedBlueprint throws over the node cap", () => {
+	const bp: Blueprint = {
+		name: "g",
+		nodes: [
+			{ id: "a", run: "ls" },
+			{ id: "b", run: "pwd" },
+			{ id: "c", run: "echo hi" },
+		],
+	};
+	assert.throws(
+		() => normalizeGeneratedBlueprint(bp, { maxNodes: 2, fanOutCap: 20, forceApprovalOnWrite: false }),
+		/exceeds node cap: 3 > 2/,
+	);
+});
+
+test("normalizeGeneratedBlueprint clamps fan_out_limit and never mutates the input", () => {
+	const bp: Blueprint = {
+		name: "g",
+		nodes: [
+			{ id: "a", run: "ls" },
+			{ id: "b", agent: "scout", prompt: "{{item}}", depends_on: ["a"], fan_out_from: "a", fan_out_limit: 100 },
+		],
+	};
+	const out = normalizeGeneratedBlueprint(bp, { maxNodes: 10, fanOutCap: 20, forceApprovalOnWrite: false });
+	assert.equal(out.bp.nodes[1].fan_out_limit, 20);
+	assert.equal(bp.nodes[1].fan_out_limit, 100, "the original object is not mutated");
+});
+
+test("normalizeGeneratedBlueprint forces requires_approval on code nodes only", () => {
+	const bp: Blueprint = {
+		name: "g",
+		nodes: [
+			{ id: "c", run: "echo hi" },
+			{ id: "a", agent: "scout", prompt: "x" },
+		],
+	};
+	const out = normalizeGeneratedBlueprint(bp, { maxNodes: 10, fanOutCap: 20, forceApprovalOnWrite: true });
+	assert.equal(out.bp.nodes[0].requires_approval, true);
+	assert.equal(out.bp.nodes[1].requires_approval, undefined);
+	assert.ok(out.notes.some((n) => /force-gated/.test(n)));
+});
+
+test("normalized + validated generated blueprint runs through runBlueprint", async () => {
+	const r = parseBlueprintFromText(
+		'```json\n{"name":"g","nodes":[{"id":"a","agent":"scout","prompt":"x"},{"id":"b","run":"echo hi","depends_on":["a"]}]}\n```',
+	);
+	const norm = normalizeGeneratedBlueprint(r.bp!, { maxNodes: 10, fanOutCap: 20, forceApprovalOnWrite: false });
+	validateBlueprint(norm.bp, reg);
+	const order: string[] = [];
+	const out = await runBlueprint(norm.bp, {}, recordingExec(order));
+	assert.deepEqual(
+		out.nodes.map((n) => n.status),
+		["done", "done"],
 	);
 });

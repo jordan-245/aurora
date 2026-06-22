@@ -11,7 +11,10 @@ import {
 	isPrewarmed,
 	POOL_MIN_BATCH,
 	pickTransport,
+	poolBand,
 	poolFor,
+	poolStatsAll,
+	reapAllPools,
 } from "../src/pool-transport.ts";
 
 // Minimal valid bundles — only fields required by AgentBundle.
@@ -100,4 +103,74 @@ test("drainAllPools clears the registry; poolFor returns a fresh pool afterwards
 	assert.notStrictEqual(post, pre, "a new WarmPool is returned after drain (not the old stale one)");
 
 	await drainAllPools(); // cleanup so tests don't leak state
+});
+
+// --- elastic band (env-driven) ---
+
+test("poolFor with default env yields min=max from POOL_SIZE (target===min)", async () => {
+	try {
+		const p = poolFor(b1);
+		const s = p.stats();
+		// With env unset, poolBand collapses to {min:max} = HARNESS_POOL_SIZE (default 4); target starts at min.
+		const band = poolBand();
+		assert.equal(s.min, band.min, "min from band");
+		assert.equal(s.max, band.max, "max from band");
+		assert.equal(s.min, s.max, "default env ⇒ min===max (fixed band)");
+		assert.equal(s.target, s.min, "target starts at min (grow on demand)");
+		assert.equal(s.total, 0, "still lazy — no workers spawned");
+	} finally {
+		await drainAllPools();
+	}
+});
+
+test("poolBand parses HARNESS_POOL_MIN/MAX overrides", () => {
+	const prevSize = process.env.HARNESS_POOL_SIZE;
+	const prevMin = process.env.HARNESS_POOL_MIN;
+	const prevMax = process.env.HARNESS_POOL_MAX;
+	try {
+		process.env.HARNESS_POOL_MIN = "2";
+		process.env.HARNESS_POOL_MAX = "9";
+		delete process.env.HARNESS_POOL_SIZE;
+		assert.deepEqual(poolBand(), { min: 2, max: 9 }, "min/max parsed from env");
+
+		// min is clamped to never exceed max
+		process.env.HARNESS_POOL_MIN = "20";
+		process.env.HARNESS_POOL_MAX = "5";
+		assert.deepEqual(poolBand(), { min: 5, max: 5 }, "min clamped down to max");
+
+		// unset min/max fall back to HARNESS_POOL_SIZE for both
+		delete process.env.HARNESS_POOL_MIN;
+		delete process.env.HARNESS_POOL_MAX;
+		process.env.HARNESS_POOL_SIZE = "6";
+		assert.deepEqual(poolBand(), { min: 6, max: 6 }, "size is the default for both bounds");
+	} finally {
+		if (prevSize === undefined) delete process.env.HARNESS_POOL_SIZE;
+		else process.env.HARNESS_POOL_SIZE = prevSize;
+		if (prevMin === undefined) delete process.env.HARNESS_POOL_MIN;
+		else process.env.HARNESS_POOL_MIN = prevMin;
+		if (prevMax === undefined) delete process.env.HARNESS_POOL_MAX;
+		else process.env.HARNESS_POOL_MAX = prevMax;
+	}
+});
+
+test("poolStatsAll / reapAllPools iterate the registry", async () => {
+	try {
+		poolFor(b1);
+		poolFor(b2);
+
+		const stats = poolStatsAll();
+		assert.equal(stats.length, 2, "one entry per registered pool");
+		const names = stats.map((s) => s.name).sort();
+		assert.deepEqual(names, ["pool-test-a", "pool-test-b"], "names mirror the registry");
+		for (const s of stats) {
+			assert.equal(s.total, 0, "lazy pools have no workers");
+			assert.equal(typeof s.target, "number", "PoolStats fields present");
+		}
+
+		// reapAllPools maps each pool → reaped count; lazy pools have nothing idle to reap.
+		const reaped = await reapAllPools(Date.now(), 0);
+		assert.deepEqual(reaped, [0, 0], "no idle workers ⇒ zero reaped per pool");
+	} finally {
+		await drainAllPools();
+	}
 });

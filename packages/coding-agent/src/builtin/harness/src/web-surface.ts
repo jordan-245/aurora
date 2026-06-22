@@ -44,7 +44,13 @@ export function snapshot(vm: ViewModel) {
 		endedAt: a.endedAt,
 		tools: (a.timeline ?? []).length,
 	}));
-	return { counts: counts(vm), agents, startedAt: vm.startedAt };
+	return {
+		counts: counts(vm),
+		agents,
+		startedAt: vm.startedAt,
+		governor: vm.governor ?? null, // #1/#4 governor signals (null until a spawn surfaces them)
+		autoscale: vm.autoscale ?? null, // #3 latest autoscaler decisions (null unless the autoscaler is armed)
+	};
 }
 
 /** Self-contained HTML+JS dashboard page (no external deps). */

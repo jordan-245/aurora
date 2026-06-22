@@ -28,6 +28,7 @@ export type RunEventType =
 	| "node_skipped" // { node, skipped_by: string[] }
 	| "approval_requested" // { gate, summary, node? }
 	| "approval_decided" // { gate, approved: boolean, by?, reason? }
+	| "quorum_decided" // { node, agreement, decidedBy, survivors, candidates, groupSize? } — best-of-N outcome
 	| "run_finished"; // { status: "done"|"failed"|"paused" }
 
 export interface RunEvent {

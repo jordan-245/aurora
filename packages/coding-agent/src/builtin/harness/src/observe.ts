@@ -13,13 +13,35 @@ export interface AgentView {
 	verify?: boolean;
 	timeline: { tool: string; startedAt: number; endedAt?: number }[];
 }
+// One autoscaler decision surfaced for the live fleet panel (from the 'autoscale' agent-event).
+export interface FleetTick {
+	bundle: string;
+	current: number;
+	target: number;
+	action: string;
+}
 export interface ViewModel {
 	agents: Map<string, AgentView>;
 	startedAt: number;
 	expanded?: string;
+	// Governor signals (#1/#4): rolling-window %, weighted load %, and queue depth. Optional + additive
+	// so a missing field never blanks a gauge; populated defensively from events that carry them.
+	governor?: { windowPct: number; loadPct: number; queued: number };
+	autoscale?: FleetTick[]; // latest per-bundle controller decisions (#3), when the autoscaler is armed
 }
 
 export const emptyVM = (): ViewModel => ({ agents: new Map(), startedAt: Date.now() });
+
+// Defensively fold governor signals off any event that carries them (carry-forward so a missing field
+// never zeroes a gauge). Adds NO running agent, so isAnimating is unaffected (jitter invariant).
+function captureGov(vm: ViewModel, e: any): void {
+	if (typeof e.window_pct !== "number" && typeof e.load_pct !== "number" && typeof e.queue_depth !== "number") return;
+	const g = vm.governor ?? { windowPct: 0, loadPct: 0, queued: 0 };
+	if (typeof e.window_pct === "number") g.windowPct = e.window_pct;
+	if (typeof e.load_pct === "number") g.loadPct = e.load_pct;
+	if (typeof e.queue_depth === "number") g.queued = e.queue_depth;
+	vm.governor = g;
+}
 
 export function reduce(vm: ViewModel, e: any): void {
 	if (!e || typeof e.id !== "string") return;
@@ -33,6 +55,26 @@ export function reduce(vm: ViewModel, e: any): void {
 				startedAt: e.ts ?? Date.now(),
 				timeline: [],
 			});
+			captureGov(vm, e);
+			break;
+		case "queued":
+			captureGov(vm, e);
+			break;
+		case "admitted":
+			captureGov(vm, e);
+			if (vm.governor) vm.governor.queued = Math.max(0, vm.governor.queued - 1);
+			break;
+		case "scaling":
+			captureGov(vm, e);
+			break;
+		case "autoscale":
+			if (Array.isArray(e.ticks))
+				vm.autoscale = e.ticks.map((t: any) => ({
+					bundle: String(t.bundle ?? ""),
+					current: Number(t.current) || 0,
+					target: Number(t.target) || 0,
+					action: String(t.action ?? ""),
+				}));
 			break;
 		case "tool": {
 			const a = vm.agents.get(e.id);
@@ -57,6 +99,7 @@ export function reduce(vm: ViewModel, e: any): void {
 				a.verify = e.verify;
 				a.tool = undefined;
 			}
+			captureGov(vm, e);
 			break;
 		}
 	}
@@ -119,6 +162,13 @@ const dur = (ms: number) => {
 	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
 };
 const trunc = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, Math.max(0, n - 1))}…`);
+// A compact mini-bar for a 0..100 percentage: cool (slack) → lime → fuchsia (saturated). Pure.
+function gauge(pct: number, w = 12): string {
+	const p = Math.max(0, Math.min(100, Math.round(pct)));
+	const filled = Math.round((p / 100) * w);
+	const col = p >= 85 ? PAL.fail : p >= 60 ? PAL.verify : PAL.run;
+	return fg(col, "█".repeat(filled)) + fg(PAL.border, "░".repeat(Math.max(0, w - filled)));
+}
 
 export function counts(vm: ViewModel) {
 	const a = [...vm.agents.values()];
@@ -198,7 +248,22 @@ export function renderWidget(vm: ViewModel, width: number = 72, frame = 0): stri
 	const mark = fg(PAL.muted, "⬢ ") + gradText("SUMMON", (frame % 60) / 60);
 	const stat = `${fg(PAL.run, `▸${run}`)} ${fg(PAL.done, `✓${ok}`)} ${fg(PAL.fail, `✗${bad}`)}`;
 	L.push(`${mark}  ${stat}  ${fg(PAL.border, "·")}  ${fg(PAL.muted, `⏱ ${elapsed}`)}`);
-	if (total === 0) return L; // drill-in pinned but no agents yet: header only
+	// Governor gauge (#1/#4): weighted load + rolling-window budget + queue depth. Rendered above the
+	// agents panel (and even with zero agents) when any spawn has surfaced governor signals. Static —
+	// a pure function of vm, so it never arms a timer or trips isAnimating.
+	if (vm.governor) {
+		const g = vm.governor;
+		let line =
+			fg(PAL.muted, "load ") +
+			gauge(g.loadPct) +
+			fg(PAL.muted, ` ${g.loadPct}%`) +
+			fg(PAL.muted, "   win ") +
+			gauge(g.windowPct) +
+			fg(PAL.muted, ` ${g.windowPct}%`);
+		if (g.queued > 0) line += fg(PAL.muted, "   queue ") + fg(PAL.run, String(g.queued));
+		L.push(line);
+	}
+	if (total === 0) return L; // drill-in pinned but no agents yet: header (+ gauge) only
 	// agents panel
 	const title = "agents";
 	L.push(
@@ -223,6 +288,29 @@ export function renderWidget(vm: ViewModel, width: number = 72, frame = 0): stri
 		L.push(frameRow(W, left, right, verified ? PAL.verify : PAL.muted));
 	}
 	L.push(fg(PAL.border, `╰${"─".repeat(W - 2)}╯`));
+	// Fleet panel (#3/#4): per-bundle pool size current→target as the autoscaler resizes it. Only present
+	// when the autoscaler is armed (HARNESS_AUTOSCALE=1); a pure function of vm, no timer.
+	if (vm.autoscale?.length) {
+		const ft = "fleet";
+		L.push(
+			fg(PAL.border, "╭─ ") +
+				fg(PAL.muted, ft) +
+				" " +
+				fg(PAL.border, `${"─".repeat(Math.max(0, W - ft.length - 5))}╮`),
+		);
+		for (const t of vm.autoscale.slice(-6)) {
+			const grow = t.target > t.current;
+			const shrink = t.target < t.current;
+			const arrow = grow ? "↑" : shrink ? "↓" : "·";
+			const left: [string, string][] = [
+				[t.bundle.padEnd(12), PAL.text],
+				[`pool ${t.current}→${t.target} ${arrow}`, grow ? PAL.run : PAL.muted],
+				[`  ${t.action}`, PAL.muted],
+			];
+			L.push(frameRow(W, left, "", PAL.muted));
+		}
+		L.push(fg(PAL.border, `╰${"─".repeat(W - 2)}╯`));
+	}
 	// drill-in detail (the selected agent's tool timeline)
 	if (vm.expanded !== undefined && vm.agents.has(vm.expanded)) {
 		const a = vm.agents.get(vm.expanded)!;

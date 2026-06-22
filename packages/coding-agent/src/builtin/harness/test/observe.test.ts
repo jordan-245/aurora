@@ -156,3 +156,57 @@ test("isAnimating: animate while an agent runs, quiesce when idle (no idle jutte
 test("renderWidget: idle (no agents, no drill-in) renders NOTHING — clean prompt, no idle chrome", () => {
 	assert.deepEqual(renderWidget(emptyVM()), []);
 });
+
+// ── governor / autoscale surfacing (#1/#3/#4) ───────────────────────────────────
+
+test("reduce captures governor window_pct/load_pct off spawned and done (carry-forward)", () => {
+	const vm = feed([
+		{ t: "spawned", id: "a", agent: "scout", model: "fast", window_pct: 30, load_pct: 50, ts: 1 },
+		{ t: "done", id: "a", status: "done", window_pct: 35, ts: 2 },
+	]);
+	assert.equal(vm.governor?.windowPct, 35, "windowPct updates");
+	assert.equal(vm.governor?.loadPct, 50, "loadPct carries forward when a later event omits it");
+});
+
+test("reduce tracks queue depth from queued and decrements on admitted", () => {
+	const vm = feed([
+		{ t: "queued", id: "q1", agent: "b", queue_depth: 3, load_pct: 90 },
+		{ t: "admitted", id: "q1", agent: "b", waited_ms: 120 },
+	]);
+	assert.equal(vm.governor?.queued, 2, "admitted drops the queue depth by one (floored at 0)");
+	assert.equal(vm.governor?.loadPct, 90);
+});
+
+test("reduce: governor/queued state does NOT make isAnimating true (jitter invariant)", () => {
+	const vm = feed([
+		{ t: "queued", id: "q1", agent: "b", queue_depth: 1, load_pct: 10, window_pct: 5 },
+		{ t: "autoscale", id: "fleet", ticks: [{ bundle: "b", current: 0, target: 2, action: "grow" }] },
+	]);
+	assert.equal(isAnimating(vm), false, "no running agent -> the timer must still quiesce");
+});
+
+test("reduce: autoscale event populates vm.autoscale for the fleet panel", () => {
+	const vm = feed([
+		{ t: "autoscale", id: "fleet", ticks: [{ bundle: "builder", current: 1, target: 4, action: "grow" }] },
+	]);
+	assert.equal(vm.autoscale?.length, 1);
+	assert.equal(vm.autoscale?.[0].target, 4);
+});
+
+test("renderWidget: governor gauge renders above the agents panel", () => {
+	const vm = feed([{ t: "spawned", id: "a", agent: "b", model: "fast", window_pct: 40, load_pct: 75, ts: 1 }]);
+	const lines = renderWidget(vm, 72, 0);
+	assert.ok(
+		lines.some((l) => l.includes("load") && l.includes("win")),
+		"governor gauge present above the agents panel",
+	);
+});
+
+test("renderWidget: byte-stable for identical (vm, frame)", () => {
+	const vm = feed([
+		{ t: "spawned", id: "a", agent: "scout", model: "fast", window_pct: 20, load_pct: 40, ts: 1 },
+		{ t: "done", id: "a", status: "done", ts: 2 }, // settled → per-agent duration is fixed
+		{ t: "autoscale", id: "fleet", ticks: [{ bundle: "scout", current: 1, target: 2, action: "grow" }] },
+	]);
+	assert.deepEqual(renderWidget(vm, 72, 3), renderWidget(vm, 72, 3));
+});

@@ -318,17 +318,44 @@ export interface WindowGovernorOpts {
 	maxWeight?: number;
 	windowMs?: number;
 	budgetTokens?: number; // 0 => tracking only (no hard gate, never hangs a session)
+	now?: () => number; // injectable clock for offline wait-latency tests; default () => Date.now()
+	// When true, in-flight reserved (pre-admission, approximate) tokens also count toward the window
+	// gate, so a burst can't over-commit the budget before completions land. Default false = the
+	// admission decision is byte-identical to a consumed()-only gate.
+	reserveGate?: boolean;
+}
+// Hooks let the dependency-free core surface admission transitions to the caller's event bus WITHOUT
+// importing it: the extension passes plain callbacks (so core stays unit-testable offline). reserveTokens
+// is an APPROXIMATE pre-admission estimate (output bytes are unknown until completion) that is
+// reconciled — subtracted — when the admitted slot is released.
+export interface AdmitHooks {
+	onQueued?: (info: { queueDepth: number; w: number }) => void;
+	onAdmitted?: (info: { waitedMs: number; w: number }) => void;
+	reserveTokens?: number;
 }
 export class WindowGovernor {
 	private inUse = 0;
-	private readonly maxWeight: number;
+	private maxWeight: number; // mutable: the scale dial (#4) can resize the cap at runtime
 	private readonly windowMs: number;
 	private readonly budgetTokens: number;
+	private readonly clock: () => number;
+	private readonly reserveGate: boolean;
 	private events: Array<{ ts: number; tokens: number }> = [];
+	// FIFO admission queue: each waiter carries its weight, its reservation, the enqueue time (for
+	// wait-latency), and the resolver pump() calls when the slot frees.
+	private waiters: Array<{ w: number; reserve: number; enqueuedAt: number; resolve: () => void }> = [];
+	// Sum of admit-time reservations not yet reconciled on release (surfaced via reservedTokens()).
+	private reserved = 0;
+	// Single re-pump timer for waiters blocked SOLELY by the rolling-window budget: such a waiter is
+	// not woken by a release/record (only by usage aging OUT of the window), so we arm one .unref()'d
+	// timer to re-pump at the age-out moment. Only ever armed when a hard budget gate is configured.
+	private windowTimer: ReturnType<typeof setTimeout> | null = null;
 	constructor(opts: WindowGovernorOpts = {}) {
 		this.maxWeight = opts.maxWeight ?? 8;
 		this.windowMs = opts.windowMs ?? DEFAULT_WINDOW_MS;
 		this.budgetTokens = Math.max(0, opts.budgetTokens ?? 0);
+		this.clock = opts.now ?? (() => Date.now());
+		this.reserveGate = opts.reserveGate ?? false;
 	}
 	private prune(now: number): void {
 		const cut = now - this.windowMs;
@@ -354,18 +381,93 @@ export class WindowGovernor {
 	loadPct(): number {
 		return Math.round((this.inUse / this.maxWeight) * 100);
 	}
-	private hasHeadroom(w: number): boolean {
+	// Runtime scale dial (#4): resize the weighted concurrency cap. Raising it wakes waiters that now
+	// fit; lowering it simply gates new admissions until in-flight work drains (never kills running work).
+	setMaxWeight(n: number): void {
+		this.maxWeight = Math.max(1, Math.floor(n));
+		this.pump();
+	}
+	maxWeightCap(): number {
+		return this.maxWeight;
+	}
+	// Whether a task of weight `w` (optionally reserving `reserve` tokens) fits right now.
+	private hasHeadroom(w: number, reserve = 0): boolean {
 		if (this.inUse + w > this.maxWeight) return false; // concurrency cap
-		if (this.budgetTokens && this.consumed() >= this.budgetTokens) return false; // window exhausted
+		// reserved tokens only gate admission when reserveGate is on; off (the default) is byte-identical
+		// to the historical consumed()-only gate.
+		const used = this.consumed() + (this.reserveGate ? this.reserved + reserve : 0);
+		if (this.budgetTokens && used >= this.budgetTokens) return false; // window exhausted
 		return true;
 	}
-	async admit(b: AgentBundle): Promise<() => void> {
-		const w = WEIGHT[b.model_tier];
-		while (!this.hasHeadroom(w)) await new Promise((r) => setTimeout(r, 200));
-		this.inUse += w;
+	private makeRelease(w: number, reserve: number): () => void {
 		return () => {
 			this.inUse -= w;
+			this.reserved = Math.max(0, this.reserved - reserve);
+			this.pump();
 		};
+	}
+	// FIFO head-of-line wake: while the FRONT waiter now fits, admit it. pump() OWNS the inUse/reserved
+	// increment for queued waiters — the admit() continuation must NOT re-add them (else double-count).
+	private pump(): void {
+		while (this.waiters.length && this.hasHeadroom(this.waiters[0].w, this.waiters[0].reserve)) {
+			const next = this.waiters.shift()!;
+			this.inUse += next.w;
+			this.reserved += next.reserve;
+			next.resolve();
+		}
+		this.scheduleWindowWake();
+	}
+	// Arm one re-pump for a head waiter blocked ONLY by the window budget (concurrency has room): such a
+	// waiter is freed by usage aging out of the window, which is not an event, so we wake it precisely at
+	// the age-out moment instead of busy-polling. No-op without a hard budget or when nothing can age out.
+	private scheduleWindowWake(): void {
+		if (!this.budgetTokens || this.windowTimer || this.waiters.length === 0) return;
+		const head = this.waiters[0];
+		if (this.inUse + head.w > this.maxWeight) return; // blocked by concurrency: a release will wake it
+		const now = this.clock();
+		this.prune(now);
+		if (this.events.length === 0) return; // nothing to age out (e.g. blocked purely by reservations)
+		const ageOutIn = Math.max(1, this.events[0].ts + this.windowMs - now);
+		const t = setTimeout(() => {
+			this.windowTimer = null;
+			this.pump();
+		}, ageOutIn);
+		t.unref?.();
+		this.windowTimer = t;
+	}
+	async admit(b: AgentBundle, hooks?: AdmitHooks): Promise<() => void> {
+		const w = WEIGHT[b.model_tier];
+		const reserve = hooks?.reserveTokens ?? 0;
+		if (this.hasHeadroom(w, reserve)) {
+			this.inUse += w;
+			this.reserved += reserve;
+			return this.makeRelease(w, reserve);
+		}
+		const enqueuedAt = this.clock();
+		await new Promise<void>((resolve) => {
+			this.waiters.push({ w, reserve, enqueuedAt, resolve });
+			hooks?.onQueued?.({ queueDepth: this.waiters.length, w });
+			this.scheduleWindowWake();
+		});
+		// pump() already incremented inUse + reserved for this waiter before resolving — do NOT re-add.
+		hooks?.onAdmitted?.({ waitedMs: this.clock() - enqueuedAt, w });
+		return this.makeRelease(w, reserve);
+	}
+	// ── introspection (pure reads; safe to call any time, no side effects) ──
+	queueDepth(): number {
+		return this.waiters.length;
+	}
+	oldestWaitMs(now = this.clock()): number {
+		return this.waiters.length ? now - this.waiters[0].enqueuedAt : 0;
+	}
+	inUseWeight(): number {
+		return this.inUse;
+	}
+	headroom(): number {
+		return Math.max(0, this.maxWeight - this.inUse);
+	}
+	reservedTokens(): number {
+		return this.reserved;
 	}
 }
 
@@ -717,6 +819,98 @@ export async function runWithReview(
 	const r = await review(b);
 	const d = reviewDecision(b.status, r.artifact_excerpt);
 	return { build: b, review: r, approved: d.approved, reason: d.reason };
+}
+
+// ── best-of-N / quorum (pure + injectable → unit-testable, mirrors runWithReview) ─────────────
+// Spawn K candidate attempts of one agent, keep only those that passed deterministic verify + contract
+// (status === "done" — see finalizeResult), pick a winner by objective majority vote among identical
+// outputs, and fall back to an injected judge over the survivors only when they diverge. No
+// subprocess/fs knowledge — the caller injects the candidate + judge closures.
+export interface QuorumOutcome {
+	winner?: SpawnResult; // chosen candidate; undefined iff every candidate failed verify/contract
+	ranking: SpawnResult[]; // all candidates, winner first, then spawn order
+	survivors: SpawnResult[]; // candidates with status === "done" (verify + contract passed)
+	agreement: "majority" | "judged" | "none";
+	decidedBy: "vote" | "judge" | "no-survivor";
+	groupSize?: number; // size of the winning identical-output group (vote path only)
+	judge?: SpawnResult; // the judge's own result (judged path only)
+}
+
+// Equivalence key for the majority vote: whitespace-collapsed output text. APPROXIMATE (textual
+// identity, not semantic) — the judge fallback is the correctness backstop.
+export function candidateKey(r: SpawnResult): string {
+	return (r.artifact_excerpt ?? "").replace(/\s+/g, " ").trim();
+}
+
+// Pure pre-filter + grouping: survivors = candidates whose status is "done" (which, per finalizeResult,
+// means the contract passed AND any supplied deterministic verify passed); grouped by candidateKey.
+export function tallyQuorum(results: SpawnResult[]): { groups: Map<string, SpawnResult[]>; survivors: SpawnResult[] } {
+	const survivors = results.filter((r) => r.status === "done");
+	const groups = new Map<string, SpawnResult[]>();
+	for (const r of survivors) {
+		const k = candidateKey(r);
+		const g = groups.get(k);
+		if (g) g.push(r);
+		else groups.set(k, [r]);
+	}
+	return { groups, survivors };
+}
+
+// Parse a judge verdict like "## verdict\nAPPROVE candidate 2" → 2 (bounds-checked), else undefined.
+export function parseQuorumPick(text: string, n: number): number | undefined {
+	const m = text.match(/##\s*verdict\b([\s\S]*?)(?:\n##\s|$)/i);
+	const section = m ? m[1] : text;
+	const pick = section.match(/(?:candidate|#)\s*(\d+)/i);
+	if (!pick) return undefined;
+	const i = Number(pick[1]);
+	return Number.isInteger(i) && i >= 0 && i < n ? i : undefined;
+}
+
+// The pure combinator. candidates/judge are injected closures; a candidate that throws is captured as a
+// failed SpawnResult (never rethrown). maxN caps how many candidate closures are invoked.
+export async function runQuorum(
+	candidates: Array<() => Promise<SpawnResult>>,
+	judge: (survivors: SpawnResult[]) => Promise<SpawnResult>,
+	opts: { maxN?: number } = {},
+): Promise<QuorumOutcome> {
+	const n = Math.max(1, opts.maxN ?? candidates.length);
+	const all = await Promise.all(
+		candidates.slice(0, n).map((c) =>
+			c().catch(
+				(e): SpawnResult => ({
+					agent: "quorum",
+					status: "failed",
+					artifact_excerpt: e instanceof Error ? e.message : String(e),
+					contract: { passed: false, missing: [] },
+					meta: { model: "", elapsed_s: 0, bytes: 0 },
+				}),
+			),
+		),
+	);
+	const rankBy = (winners: SpawnResult[]): SpawnResult[] => [...winners, ...all.filter((r) => !winners.includes(r))];
+	const { groups, survivors } = tallyQuorum(all);
+	if (survivors.length === 0)
+		return { winner: undefined, ranking: all, survivors, agreement: "none", decidedBy: "no-survivor" };
+	// Largest identical-output group (deterministic: Map preserves first-insertion order on ties).
+	let best: SpawnResult[] = [];
+	for (const g of groups.values()) if (g.length > best.length) best = g;
+	if (best.length > survivors.length / 2) {
+		const winner = best[0];
+		return {
+			winner,
+			ranking: rankBy([winner]),
+			survivors,
+			agreement: "majority",
+			decidedBy: "vote",
+			groupSize: best.length,
+		};
+	}
+	// No strict majority among distinct survivors → judge. Fail-SAFE (not closed) to the first survivor if
+	// the verdict is unparseable, because every survivor already passed deterministic verify + contract.
+	const v = await judge(survivors);
+	const pick = parseQuorumPick(v.artifact_excerpt ?? "", survivors.length);
+	const winner = survivors[pick ?? 0] ?? survivors[0];
+	return { winner, ranking: rankBy([winner]), survivors, agreement: "judged", decidedBy: "judge", judge: v };
 }
 
 // ── public entry point: thin wrapper that applies bundle.max_attempts via withRetry ──
