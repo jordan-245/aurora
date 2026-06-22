@@ -10,6 +10,7 @@ import {
 	type AgentBundle,
 	appendExpertiseNote,
 	assertSpawnAuth,
+	authExtensions,
 	buildSystemPrompt,
 	buildWorkerArgs,
 	candidateKey,
@@ -75,10 +76,11 @@ test("buildWorkerArgs carries the mode head, model, system prompt, and tool allo
 });
 
 test("buildWorkerArgs loads the write-guard only for write/exec-capable workers", () => {
-	const readOnly = buildWorkerArgs({ ...base, tools: ["read"] }, ["-p"]);
+	// Pass an explicit empty env so ambient SUMMON_AUTH_EXTENSIONS can't inject a stray -e and bleed in.
+	const readOnly = buildWorkerArgs({ ...base, tools: ["read"] }, ["-p"], {});
 	assert.ok(!readOnly.includes("-e"), "read-only worker must not load the guard extension");
 	for (const tool of ["bash", "write", "edit"]) {
-		const args = buildWorkerArgs({ ...base, tools: ["read", tool] }, ["-p"]);
+		const args = buildWorkerArgs({ ...base, tools: ["read", tool] }, ["-p"], {});
 		assert.ok(args.includes("-e"), `${tool}-capable worker must load the guard extension`);
 	}
 });
@@ -686,7 +688,45 @@ test("assertSpawnAuth allows an API key by default but fails closed when OAuth i
 		() => assertSpawnAuth({ ANTHROPIC_API_KEY: "sk-x", SUMMON_FORCE_OAUTH_ROUTING: "1" }, SYS_HEADER),
 		/ANTHROPIC_API_KEY is present/,
 	);
-	assert.doesNotThrow(() => assertSpawnAuth({ SUMMON_FORCE_OAUTH_ROUTING: "1" }, SYS_HEADER));
+	// Forced OAuth, key ejected, but NO auth extension declared: the sealed worker has no credential
+	// path, so spawning must fail closed (loud) rather than silently emit "No API key" + 0 bytes.
+	assert.throws(
+		() => assertSpawnAuth({ SUMMON_FORCE_OAUTH_ROUTING: "1" }, SYS_HEADER),
+		/no credential path|SUMMON_AUTH_EXTENSIONS/,
+	);
+	// Forced OAuth WITH a resolvable auth extension declared: the worker can authenticate -> allowed.
+	const dir = join(tmpdir(), `auth-ext-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	mkdirSync(dir, { recursive: true });
+	const extFile = join(dir, "index.ts");
+	writeFile(extFile, "export default () => {};");
+	assert.doesNotThrow(() =>
+		assertSpawnAuth({ SUMMON_FORCE_OAUTH_ROUTING: "1", SUMMON_AUTH_EXTENSIONS: extFile }, SYS_HEADER),
+	);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("authExtensions resolves declared credential paths and survives the worker seal via -e", () => {
+	const dir = join(tmpdir(), `auth-ext-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	mkdirSync(dir, { recursive: true });
+	const a = join(dir, "a.ts");
+	const b = join(dir, "b.ts");
+	writeFile(a, "export default () => {};");
+	writeFile(b, "export default () => {};");
+	const missing = join(dir, "nope.ts");
+
+	// Empty / unset -> none.
+	assert.deepEqual(authExtensions({}), []);
+	// JSON array form (robust to path separators).
+	assert.deepEqual(authExtensions({ SUMMON_AUTH_EXTENSIONS: JSON.stringify([a, b]) }), [a, b]);
+	// Delimiter/comma-separated form, with a missing path silently dropped.
+	assert.deepEqual(authExtensions({ SUMMON_AUTH_EXTENSIONS: `${a},${missing}` }), [a]);
+
+	// buildWorkerArgs injects each declared auth extension via explicit -e, past WORKER_SEAL_FLAGS.
+	const args = buildWorkerArgs({ ...base, tools: ["read"] }, ["-p"], { SUMMON_AUTH_EXTENSIONS: a });
+	assert.ok(args.includes("--no-extensions"), "seal flag still present");
+	const i = args.indexOf("-e");
+	assert.ok(i >= 0 && args[i + 1] === a, "auth extension injected via -e");
+	rmSync(dir, { recursive: true, force: true });
 });
 
 // ── window-aware governor ──────────────────────────────────────────────────────

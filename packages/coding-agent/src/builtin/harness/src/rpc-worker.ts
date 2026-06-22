@@ -36,9 +36,8 @@ export class RpcWorker implements PooledWorker {
 		// discovery), the explicit skill, and the write-guard. Sealing keeps a pooled
 		// worker fast (no jiti init / fs walks) and isolated (no ambient project
 		// context leaking into a reused, tool-restricted sub-agent).
-		const args = buildWorkerArgs(bundle, ["--mode", "rpc", "--no-session"]);
-
 		const env = spawnEnv(opts.root, opts.protected);
+		const args = buildWorkerArgs(bundle, ["--mode", "rpc", "--no-session"], env);
 		assertSpawnAuth(env, sys); // fail-closed auth check before we spawn the rpc worker
 
 		const { cmd, prefix } = agentSpawnCommand();

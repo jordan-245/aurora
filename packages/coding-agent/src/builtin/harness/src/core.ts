@@ -4,7 +4,7 @@
 import { type SpawnSyncReturns, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { agentSpawnCommand, AGENTS_DIR as GLOBAL_AGENTS } from "./paths.ts"; // derived from install location, env-overridable
 
 export interface OutputContract {
@@ -286,6 +286,41 @@ export function spawnEnv(root?: string, protectedList?: string[]): NodeJS.Proces
 	env.HARNESS_PROTECTED = JSON.stringify(protectedList ?? DEFAULT_PROTECTED);
 	return env;
 }
+// Extensions that supply provider CREDENTIALS (e.g. Claude subscription OAuth). The worker seal
+// (--no-extensions) deliberately strips project + auto-discovered extensions for isolation, but a
+// credential provider is infrastructure the worker MUST carry to authenticate. buildWorkerArgs
+// injects each via explicit -e (which survives the seal, exactly like GUARD_EXT), so ONLY declared
+// auth paths cross the seal — never ambient project context, and the two spawn transports can't
+// drift. Declared out-of-band via SUMMON_AUTH_EXTENSIONS: a JSON array (recommended — robust to
+// path separators) or a path.delimiter/comma-separated list. Missing paths are dropped (loud, via
+// warn) so a stale entry can't wedge spawning; assertSpawnAuth() fails closed when forced-OAuth is
+// on and NONE resolve, turning the old silent "No API key" 0-byte failure into an actionable error.
+export function authExtensions(env: NodeJS.ProcessEnv = process.env): string[] {
+	const raw = (env.SUMMON_AUTH_EXTENSIONS ?? "").trim();
+	if (!raw) return [];
+	let candidates: string[];
+	if (raw.startsWith("[")) {
+		try {
+			const parsed = JSON.parse(raw);
+			candidates = Array.isArray(parsed) ? parsed.map(String) : [];
+		} catch {
+			candidates = [];
+		}
+	} else {
+		candidates = raw.split(new RegExp(`[${delimiter},]`));
+	}
+	const out: string[] = [];
+	for (const c of candidates) {
+		const p = c.trim();
+		if (!p) continue;
+		if (!existsSync(p)) {
+			console.error(`[harness] SUMMON_AUTH_EXTENSIONS: skipping missing auth extension: ${p}`);
+			continue;
+		}
+		out.push(p);
+	}
+	return out;
+}
 export function assertSpawnAuth(env: NodeJS.ProcessEnv, sysPrompt: string): void {
 	// A non-empty system prompt is always required: an empty --system-prompt routes Anthropic calls to
 	// pay-per-token "extra usage", which is never what a worker wants.
@@ -298,6 +333,16 @@ export function assertSpawnAuth(env: NodeJS.ProcessEnv, sysPrompt: string): void
 	if (forceOAuthRouting(env) && env.ANTHROPIC_API_KEY)
 		throw new Error(
 			"$0-OAuth canary: SUMMON_FORCE_OAUTH_ROUTING is set but ANTHROPIC_API_KEY is present in worker env — eject it before spawn",
+		);
+	// Fail-closed credential-path check: with the API key ejected (above), a forced-OAuth worker can
+	// ONLY authenticate through an injected auth extension. If none resolve, the sealed worker would
+	// silently emit "No API key for provider: anthropic" and 0 bytes — so refuse to spawn, loudly.
+	if (forceOAuthRouting(env) && authExtensions(env).length === 0)
+		throw new Error(
+			"$0-OAuth routing has no credential path: SUMMON_FORCE_OAUTH_ROUTING=1 ejects ANTHROPIC_API_KEY, but " +
+				"SUMMON_AUTH_EXTENSIONS resolves to no loadable extension, so the sealed worker (--no-extensions) cannot " +
+				"authenticate. Set SUMMON_AUTH_EXTENSIONS to your OAuth extension path " +
+				"(e.g. /root/.summon/extensions/anthropic-oauth/index.ts).",
 		);
 }
 
@@ -699,7 +744,7 @@ export const WORKER_SEAL_FLAGS = [
 // ["--mode","rpc","--no-session"] for the pooled rpc worker). The model, system
 // prompt, tool allowlist, seal flags, explicit skill, and write-guard are applied
 // identically so the two transports can never drift apart.
-export function buildWorkerArgs(bundle: AgentBundle, head: string[]): string[] {
+export function buildWorkerArgs(bundle: AgentBundle, head: string[], env: NodeJS.ProcessEnv = process.env): string[] {
 	const args = [
 		...head,
 		"--model",
@@ -710,6 +755,9 @@ export function buildWorkerArgs(bundle: AgentBundle, head: string[]): string[] {
 		bundle.tools.join(","),
 		...WORKER_SEAL_FLAGS,
 	];
+	// Carry declared credential extensions (e.g. subscription OAuth) past the seal via explicit -e —
+	// the only extensions allowed to cross --no-extensions, so a sealed worker can still authenticate.
+	for (const ext of authExtensions(env)) args.push("-e", ext);
 	if (bundle.skills?.length && bundle._dir) {
 		const sk = join(bundle._dir, "SKILL.md");
 		if (existsSync(sk)) args.push("--skill", sk);
@@ -735,8 +783,8 @@ export function spawnOnce(
 ): Promise<SpawnResult> {
 	const model = MODEL[bundle.model_tier];
 	const sys = buildSystemPrompt(bundle);
-	const args = buildWorkerArgs(bundle, ["-p", "--no-session", "--mode", "json"]);
 	const env = spawnEnv(opts.root, opts.protected);
+	const args = buildWorkerArgs(bundle, ["-p", "--no-session", "--mode", "json"], env);
 	assertSpawnAuth(env, sys); // fail-closed auth check before we spawn anything
 	const t0 = Date.now();
 	return new Promise((resolve) => {
