@@ -65,6 +65,20 @@ export interface TeamStepResult {
 	agent: string;
 	prompt: string;
 	result: any;
+	step_id?: string; // stable id `s<stage>.<step>` — the durable/resume key
+	resumed?: boolean; // true if served from a prior run's recorded result (not re-executed)
+}
+
+// Stable step id so durable journaling + resume can key on it (agents may repeat within a stage).
+export function teamStepId(stage: number, step: number): string {
+	return `s${stage}.${step}`;
+}
+
+// Durable/resume hooks for runTeam — ALL OPTIONAL (omitting `opts` is the old behaviour exactly).
+export interface TeamRunOpts {
+	journal?: (ev: { type: string; [k: string]: unknown }) => void;
+	skipDone?: Set<string>; // step ids recorded `done` in a prior run → not re-executed
+	recorded?: Map<string, any>; // their recorded results (returned in place)
 }
 
 // Generic, injectable team executor (no Pi knowledge → unit-testable).
@@ -73,13 +87,28 @@ export async function runTeam(
 	team: Team,
 	vars: Record<string, string>,
 	runStep: (agent: string, prompt: string) => Promise<any>,
+	opts: TeamRunOpts = {},
 ): Promise<{ team: string; stages: TeamStepResult[][] }> {
+	const journal = opts.journal ?? (() => {});
 	const stages: TeamStepResult[][] = [];
-	for (const stage of team.stages) {
+	for (const [i, stage] of team.stages.entries()) {
 		const results = await Promise.all(
-			stage.map(async (s) => {
+			stage.map(async (s, j) => {
+				const step_id = teamStepId(i, j);
 				const prompt = fillTemplate(s.prompt, vars);
-				return { agent: s.agent, prompt, result: await runStep(s.agent, prompt) };
+				// RESUME: a step recorded done in a prior run is NOT re-executed (no duplicate side effects).
+				if (opts.skipDone?.has(step_id)) {
+					return { agent: s.agent, prompt, step_id, resumed: true, result: opts.recorded?.get(step_id) };
+				}
+				journal({ type: "node_started", node: step_id, agent: s.agent });
+				const result = await runStep(s.agent, prompt);
+				journal({
+					type: "node_done",
+					node: step_id,
+					status: result?.status === "done" ? "done" : "failed",
+					output_excerpt: String(result?.artifact_excerpt ?? "").slice(0, 1500),
+				});
+				return { agent: s.agent, prompt, step_id, result };
 			}),
 		);
 		stages.push(results);

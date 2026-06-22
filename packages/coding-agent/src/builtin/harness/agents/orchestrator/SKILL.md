@@ -82,6 +82,39 @@ When the SAME shape of work recurs, don't re-plan it each turn — run a saved r
   upstream fail-closes its dependents; downstream nodes read upstream output via `{{node.<id>}}`.
   Prefer a blueprint over hand-fanning when you find yourself writing the same DAG twice — it makes the
   deterministic parts unbypassable and removes them from the model's blast radius.
+- **Dynamic fan-out (adaptive expansion).** A blueprint agent node with `fan_out_from: <depId>` is
+  expanded at run time: the upstream node's output is split into items (one per non-empty line) and the
+  node's `agent` is spawned once per item with `{{item}}` / `{{index}}` templated in. Use this when you
+  can't know the breadth up front — e.g. a scout lists N candidates, then a builder fans out one child
+  per candidate. Bound it with `fan_out_limit` (default 20).
+- **Human-in-the-loop gates.** Mark a node `requires_approval: true` to make the run **pause** at that
+  node until a human grants it via `approve_gate({ run_id, gate, approved })`. Use it before anything
+  irreversible/expensive (a deploy, a destructive migration, real spend). The run is durable — it stops
+  at the gate and resumes from exactly there once approved.
+
+## Iterate, don't one-shot (re-plan loop)
+
+Open-ended goals (research, audits, "improve X") are where multi-agent wins — but only if you **iterate
+on intermediate findings** instead of firing one frozen fan-out. Run this loop:
+1. **Persist the plan first.** State your decomposition + success criteria in your `## delegated`
+   scaffold up front (it survives compaction and anchors the run).
+2. **Fan out a wave**, await results, then **assess the gap**: did the results actually satisfy the
+   criteria? What's missing or contradictory?
+3. **Re-plan**: spawn a *targeted* next wave only for the gaps (new scouts on unexplored leads, a
+   builder to fix a rejected node). Scale effort to the gap — don't re-run what already passed.
+4. **Stop** when the criteria are met or a bounded iteration cap is hit (don't loop forever — escalate).
+5. **Grounding/citation pass.** For research/factual synthesis, run a final dedicated pass that
+   attributes each claim in your synthesis to a specific source artifact (spawn a `reviewer`/scout whose
+   sole job is "verify every claim traces to an artifact; list any that don't"). Never present
+   un-grounded claims as findings.
+
+## Durable + resumable runs
+
+`run_blueprint` / `run_team` / `spawn_agents` journal to a durable run log, so a crashed or paused run is
+recoverable. At session start the harness surfaces a `resumable-runs` event; resume one with
+`resume_run({ run_id })` — **completed nodes are not re-run** and granted approval gates are released.
+Favour this over restarting an expensive fan-out from scratch (multi-agent runs burn ~15× the tokens of
+a chat — don't pay twice).
 
 ## Parallelism & scale discipline
 

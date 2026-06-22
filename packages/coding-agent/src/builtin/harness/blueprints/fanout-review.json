@@ -1,0 +1,18 @@
+{
+  "name": "fanout-review",
+  "description": "List the files changed in the last commit, then DYNAMICALLY fan out one reviewer per file. Demonstrates fan_out_from: the 'review' node expands at run time to one child per non-empty line of the 'files' node output, with {{item}} = the file path.",
+  "nodes": [
+    {
+      "id": "files",
+      "run": "git diff --name-only HEAD~1 2>/dev/null | head -n 20"
+    },
+    {
+      "id": "review",
+      "agent": "reviewer",
+      "depends_on": ["files"],
+      "fan_out_from": "files",
+      "fan_out_limit": 20,
+      "prompt": "Review the single file {{item}} (#{{index}}) for correctness, regressions, and risk. Read only that file and what it directly imports.\n## verdict\n## claims\n## could-not-verify"
+    }
+  ]
+}

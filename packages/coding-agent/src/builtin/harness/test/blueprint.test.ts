@@ -9,6 +9,7 @@ import { test } from "node:test";
 import {
 	type Blueprint,
 	type BlueprintExec,
+	fanOutItems,
 	loadBlueprints,
 	type NodeRun,
 	runBlueprint,
@@ -254,7 +255,139 @@ test("shipped scout-build-verify blueprint validates", () => {
 		delete process.env.HARNESS_BLUEPRINTS_DIR; // use the install default (BLUEPRINTS_DIR)
 		const bps = loadBlueprints(reg);
 		assert.ok(bps.has("scout-build-verify"), "the shipped blueprint should load");
+		assert.ok(bps.has("gated-build"), "the shipped requires_approval example should validate");
+		assert.ok(bps.has("fanout-review"), "the shipped fan_out_from example should validate");
 	} finally {
 		if (saved !== undefined) process.env.HARNESS_BLUEPRINTS_DIR = saved;
 	}
+});
+
+// ── durable spine: resume skips completed nodes; approval gate pauses then resumes ──
+
+function recExec(log: string[]): BlueprintExec {
+	return {
+		runAgent: async (agent, _prompt, n) => {
+			log.push(`agent:${n.id}`);
+			return { ok: true, output: `${agent}-out` };
+		},
+		runCode: async (cmd, n) => {
+			log.push(`code:${n.id}`);
+			return { ok: true, output: `ran ${cmd}` };
+		},
+	};
+}
+
+test("resume: nodes recorded done are NOT re-run; their output flows downstream", async () => {
+	const bp: Blueprint = {
+		name: "r",
+		nodes: [
+			{ id: "a", run: "echo a" },
+			{ id: "b", agent: "scout", prompt: "use {{node.a}}", depends_on: ["a"] },
+		],
+	};
+	const log: string[] = [];
+	// 'a' already completed in a prior (crashed) run; resume should skip it and only run 'b'.
+	const out = await runBlueprint(bp, {}, recExec(log), {
+		resume: { done: new Set(["a"]), output: new Map([["a", "prior-a-output"]]) },
+	});
+	assert.deepEqual(log, ["agent:b"], "only b runs on resume");
+	const b = out.nodes.find((n) => n.id === "b")!;
+	assert.equal(b.status, "done");
+	assert.equal(b.prompt, "use prior-a-output", "downstream template used the resumed output");
+	assert.ok(!out.paused);
+});
+
+test("approval gate: run pauses at an ungranted gate, then resumes when granted", async () => {
+	const bp: Blueprint = {
+		name: "g",
+		nodes: [
+			{ id: "build", run: "echo build" },
+			{ id: "deploy", run: "echo deploy", depends_on: ["build"], requires_approval: true },
+		],
+	};
+	const events: { type: string; [k: string]: unknown }[] = [];
+	const journal = (e: { type: string; [k: string]: unknown }) => events.push(e);
+
+	// Pass 1: no approvals → build runs, deploy parks on its gate, run is PAUSED.
+	const log1: string[] = [];
+	const out1 = await runBlueprint(bp, {}, recExec(log1), { journal, isApproved: () => false });
+	assert.deepEqual(log1, ["code:build"], "deploy did NOT run while gate is ungranted");
+	assert.equal(out1.paused, true);
+	assert.deepEqual(out1.awaiting, ["deploy"]);
+	assert.ok(events.some((e) => e.type === "approval_requested" && e.gate === "deploy"));
+	assert.ok(events.some((e) => e.type === "run_finished" && e.status === "paused"));
+
+	// Pass 2 (resume): build recorded done; gate now granted → deploy runs, run completes.
+	const log2: string[] = [];
+	const out2 = await runBlueprint(bp, {}, recExec(log2), {
+		resume: { done: new Set(["build"]), output: new Map([["build", "ran echo build"]]) },
+		isApproved: (n) => n.id === "deploy",
+	});
+	assert.deepEqual(log2, ["code:deploy"], "only the gated node runs on resume");
+	assert.ok(!out2.paused, "resume completes (not paused) once the gate is granted");
+	assert.equal(out2.nodes.find((n) => n.id === "deploy")!.status, "done");
+});
+
+test("omitting opts is byte-for-byte the old behaviour (no journal, no pause)", async () => {
+	const bp: Blueprint = { name: "plain", nodes: [{ id: "x", run: "echo x" }] };
+	const out = await runBlueprint(bp, {}, recExec([]));
+	assert.equal(out.nodes[0].status, "done");
+	assert.ok(!out.paused, "a gate-free run is never paused");
+});
+
+// ── dynamic fan-out (gap 4): expand a node into N children from upstream output ──
+
+test("fanOutItems splits non-empty, de-duped, capped lines", () => {
+	assert.deepEqual(fanOutItems("a\n\nb\n a \nc\n", 10), ["a", "b", "c"]);
+	assert.deepEqual(fanOutItems("x\ny\nz\nw", 2), ["x", "y"]);
+	assert.deepEqual(fanOutItems(""), []);
+});
+
+test("fan_out_from expands one child per upstream line; node done iff all children ok", async () => {
+	const bp: Blueprint = {
+		name: "fo",
+		nodes: [
+			{ id: "list", run: "printf 'alpha\\nbeta\\ngamma\\n'" },
+			{
+				id: "work",
+				agent: "builder",
+				prompt: "do {{item}} (#{{index}})",
+				depends_on: ["list"],
+				fan_out_from: "list",
+			},
+		],
+	};
+	const seen: string[] = [];
+	const exec: BlueprintExec = {
+		runCode: async () => ({ ok: true, output: "alpha\nbeta\ngamma" }),
+		runAgent: async (_a, prompt, node) => {
+			seen.push(`${node.id}|${prompt}`);
+			return { ok: true, output: `done:${prompt}` };
+		},
+	};
+	const out = await runBlueprint(bp, {}, exec);
+	const work = out.nodes.find((n) => n.id === "work")!;
+	assert.equal(work.status, "done");
+	// three synthetic children with per-item templated prompts
+	assert.deepEqual(seen, ["work#0|do alpha (#0)", "work#1|do beta (#1)", "work#2|do gamma (#2)"]);
+	assert.match(work.output, /item 0: alpha/);
+	assert.match(work.output, /item 2: gamma/);
+});
+
+test("fan_out node fails if any child fails; validation requires fan_out_from in depends_on", () => {
+	const reg2 = new Map<string, AgentBundle>([["builder", makeBundle("builder")]]);
+	assert.throws(
+		() =>
+			validateBlueprint(
+				{
+					name: "bad",
+					nodes: [
+						{ id: "a", run: "ls" },
+						{ id: "b", agent: "builder", prompt: "{{item}}", fan_out_from: "a" },
+					],
+				},
+				reg2,
+			),
+		/must also be in depends_on/,
+	);
 });

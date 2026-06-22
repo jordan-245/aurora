@@ -3,12 +3,20 @@
 // <project>/.summon/agents, .harness.json protected paths). Wraps src/core.ts (single-sourced).
 
 import { execSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "../../../index.ts";
-import { type Blueprint, type BlueprintExec, loadBlueprints, type NodeRun, runBlueprint } from "../src/blueprint.ts";
+import {
+	type Blueprint,
+	type BlueprintExec,
+	type BlueprintNode,
+	type BlueprintOutcome,
+	loadBlueprints,
+	type NodeRun,
+	runBlueprint,
+} from "../src/blueprint.ts";
 import { cacheKey, isCacheable, ResultCache } from "../src/cache.ts";
 import {
 	buildSystemPrompt,
@@ -22,8 +30,10 @@ import {
 	writeRegistryIndex,
 } from "../src/core.ts";
 import { aggregateFleet, appendFleetEntry, auditPrompt, fleetDigest, readFleet } from "../src/fleet.ts";
-import { FLEET_LEDGER, FLEET_SUMMARY, REGISTRY_INDEX } from "../src/paths.ts";
+import { FLEET_LEDGER, FLEET_SUMMARY, REGISTRY_INDEX, RUNS_DIR } from "../src/paths.ts";
 import { drainAllPools, isPrewarmed, pickTransport, prewarm, spawnViaPool } from "../src/pool-transport.ts";
+import { blueprintResume, listResumableRuns, makeRunId, runEventsPath, runMeta } from "../src/runstore.ts";
+import { deriveState, RunSession, readEvents } from "../src/session.ts";
 import { loadTeams, runTeam } from "../src/teams.ts";
 
 export default function harness(summon: ExtensionAPI) {
@@ -49,6 +59,31 @@ export default function harness(summon: ExtensionAPI) {
 		audits: bootAudits,
 		bloated: bootAudits.filter((a) => a.over).map((a) => a.name),
 	});
+	// Durable run sessions (Phase 2/3): journal every blueprint/team/fan-out run to an append-only log so
+	// a crashed or human-paused run is discoverable + resumable. HARNESS_DURABLE=0 opts out (journaling off).
+	const DURABLE = process.env.HARNESS_DURABLE !== "0";
+	// Crash recovery: at boot, surface any run that didn't finish (crashed) or is paused on an approval gate.
+	if (DURABLE) {
+		try {
+			const resumable = listResumableRuns(RUNS_DIR);
+			if (resumable.length)
+				summon.events?.emit?.("agent-event", {
+					id: "boot",
+					agent: "harness",
+					ts: Date.now(),
+					t: "resumable-runs",
+					runs: resumable.map((r) => ({
+						runId: r.runId,
+						kind: r.kind,
+						name: r.name,
+						status: r.status,
+						awaiting: r.awaiting.length,
+					})),
+				});
+		} catch {
+			/* best-effort discovery */
+		}
+	}
 	// One place that records a finished spawn: rolling-window tokens + the cross-run fleet ledger (#8).
 	const logSpawn = (b: { name: string; model_tier: string }, r: any, spentTokens: number): void => {
 		gov.record(spentTokens);
@@ -96,6 +131,27 @@ export default function harness(summon: ExtensionAPI) {
 			.catch(() => {});
 	}
 	const runDir = (ctx: any) => join(tmpdir(), "harness-runs", ctx?.sessionId ?? "session");
+
+	// Start a durable run session (or null when DURABLE is off). The run_started event is self-describing
+	// (kind/name/vars/tasks) so resume needs nothing but the log. Returns the session + its run id.
+	function startRun(
+		kind: "blueprint" | "team" | "fanout" | "spawn",
+		name: string,
+		meta: Record<string, unknown>,
+		ctx: any,
+	): { session: RunSession | null; runId: string | null } {
+		if (!DURABLE) return { session: null, runId: null };
+		try {
+			const runId = makeRunId(kind, name, ctx?.sessionId ?? "session");
+			const session = RunSession.create(runEventsPath(RUNS_DIR, runId));
+			session.append("run_started", { kind, name, ...meta });
+			return { session, runId };
+		} catch {
+			return { session: null, runId: null }; // durability is best-effort; never block a run
+		}
+	}
+	const journalOf = (session: RunSession | null) =>
+		session ? (e: { type: string; [k: string]: unknown }) => session.append(e.type as never, e) : undefined;
 
 	async function runOne(
 		agent: string,
@@ -293,16 +349,17 @@ export default function harness(summon: ExtensionAPI) {
 				};
 			}
 			try {
-				const outcome = await runTeam(team, p.vars ?? {}, (agent, prompt) =>
-					runOne(agent, prompt, `${p.team}:${agent}`, ctx),
+				// Durable session: journal each step so a crashed team run is discoverable + resumable.
+				const { session, runId } = startRun("team", p.team, { vars: p.vars ?? {} }, ctx);
+				const outcome = await runTeam(
+					team,
+					p.vars ?? {},
+					(agent, prompt) => runOne(agent, prompt, `${p.team}:${agent}`, ctx),
+					{ journal: journalOf(session) },
 				);
-				const text = outcome.stages
-					.map((stage, i) => {
-						const stepTexts = stage.map((step) => fmt(step.result)).join("\n\n---\n\n");
-						return `=== Stage ${i + 1} ===\n\n${stepTexts}`;
-					})
-					.join("\n\n");
-				return { content: [{ type: "text", text }], details: outcome };
+				if (session) session.append("run_finished", { status: "done" });
+				const text = runId ? `${renderTeam(outcome)}\n\n(durable run: ${runId})` : renderTeam(outcome);
+				return { content: [{ type: "text", text }], details: { ...outcome, runId } };
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				return { content: [{ type: "text", text: `run_team failed: ${msg}` }], isError: true, details: undefined };
@@ -324,6 +381,103 @@ export default function harness(summon: ExtensionAPI) {
 				output: ((ex.stdout ?? "") + (ex.stderr ?? "") || ex.message || "command failed").slice(-2000),
 			};
 		}
+	}
+
+	// ── durable run helpers (Phase 2/3): journal + resume + approval. The pure DAG/team logic lives in
+	//    blueprint.ts/teams.ts (unit-tested); these are the thin wiring shared by run_blueprint /
+	//    resume_run / approve_gate. ──
+	function blueprintExec(ctx: any): BlueprintExec {
+		return {
+			runAgent: async (agent, prompt, node) => {
+				const r = await runOne(agent, prompt, node.id, ctx, node.verify);
+				return { ok: r.status === "done", output: r.artifact_excerpt ?? "", result: r };
+			},
+			runCode: async (cmd) => runCodeNode(cmd),
+		};
+	}
+
+	async function executeBlueprint(
+		bp: Blueprint,
+		vars: Record<string, string>,
+		ctx: any,
+		session: RunSession | null,
+		resume?: ReturnType<typeof blueprintResume>,
+	): Promise<BlueprintOutcome> {
+		const outcome = await runBlueprint(bp, vars, blueprintExec(ctx), {
+			journal: journalOf(session),
+			resume: resume
+				? { done: resume.done, failedOrSkipped: resume.failedOrSkipped, output: resume.output }
+				: undefined,
+			isApproved: resume ? (n: BlueprintNode) => resume.approved.has(n.id) : undefined,
+		});
+		// runBlueprint journals run_finished:paused itself; the caller owns the terminal done/failed mark.
+		if (session && !outcome.paused) {
+			const failed = outcome.nodes.some((n) => n.status === "failed" || n.status === "skipped");
+			session.append("run_finished", { status: failed ? "failed" : "done" });
+		}
+		return outcome;
+	}
+
+	function renderBlueprint(outcome: BlueprintOutcome, runId: string | null): string {
+		const body = outcome.nodes
+			.map((n) => {
+				const head = `=== ${n.id} [${n.kind}${n.agent ? `:${n.agent}` : ""}] -> ${n.status} ===`;
+				if (n.status === "skipped")
+					return `${head}\nskipped (upstream not done: ${(n.skipped_by ?? []).join(", ")})`;
+				if (n.status === "awaiting_approval") return `${head}\n\u23f8 awaiting approval`;
+				return `${head}\n${n.output.slice(0, 1200)}`;
+			})
+			.join("\n\n");
+		if (outcome.paused)
+			return (
+				`${body}\n\n\u23f8 PAUSED — awaiting approval on: ${(outcome.awaiting ?? []).join(", ")}` +
+				(runId ? `\nApprove + resume:  approve_gate({ run_id: "${runId}", gate: "<node>", approved: true })` : "")
+			);
+		return runId ? `${body}\n\n(durable run: ${runId})` : body;
+	}
+
+	function renderTeam(outcome: { stages: any[][] }): string {
+		return outcome.stages
+			.map((stage, i) => {
+				const stepTexts = stage
+					.map((step: any) => (step.resumed ? `[${step.agent} → resumed (done in prior run)]` : fmt(step.result)))
+					.join("\n\n---\n\n");
+				return `=== Stage ${i + 1} ===\n\n${stepTexts}`;
+			})
+			.join("\n\n");
+	}
+
+	// Resume any durable run from its log: blueprint = full DAG resume (skip done nodes, release granted
+	// gates); team = skip-done re-run. Returns rendered text + the outcome.
+	async function resumeRun(runId: string, ctx: any): Promise<{ text: string; outcome?: unknown; isError: boolean }> {
+		const path = runEventsPath(RUNS_DIR, runId);
+		if (!existsSync(path)) return { text: `run '${runId}' not found`, isError: true };
+		const events = readEvents(path);
+		const meta = runMeta(events);
+		if (!meta) return { text: `run '${runId}' has no run_started — cannot resume`, isError: true };
+		const session = RunSession.resume(path);
+		if (meta.kind === "blueprint") {
+			const bp = loadBlueprints(registry, process.cwd()).get(meta.name);
+			if (!bp) return { text: `blueprint '${meta.name}' no longer exists`, isError: true };
+			const outcome = await executeBlueprint(bp, meta.vars ?? {}, ctx, session, blueprintResume(events));
+			const failed = outcome.nodes.some((n) => n.status === "failed" || n.status === "skipped");
+			return { text: renderBlueprint(outcome, runId), outcome, isError: failed && !outcome.paused };
+		}
+		if (meta.kind === "team") {
+			const team = loadTeams(registry, process.cwd()).get(meta.name);
+			if (!team) return { text: `team '${meta.name}' no longer exists`, isError: true };
+			const st = deriveState(events);
+			const done = new Set([...st.nodes].filter(([, o]) => o === "done").map(([id]) => id));
+			const recorded = new Map([...st.outputs].map(([k, v]) => [k, { status: "done", artifact_excerpt: v }]));
+			const outcome = await runTeam(team, meta.vars ?? {}, (a, p) => runOne(a, p, `${team.name}:${a}`, ctx), {
+				journal: journalOf(session),
+				skipDone: done,
+				recorded,
+			});
+			session.append("run_finished", { status: "done" });
+			return { text: renderTeam(outcome), outcome, isError: false };
+		}
+		return { text: `resume not supported for run kind '${meta.kind}' (ledger only)`, isError: true };
 	}
 
 	summon.registerTool({
@@ -352,25 +506,16 @@ export default function harness(summon: ExtensionAPI) {
 					details: undefined,
 				};
 			}
-			const exec: BlueprintExec = {
-				runAgent: async (agent, prompt, node) => {
-					const r = await runOne(agent, prompt, node.id, ctx, node.verify);
-					return { ok: r.status === "done", output: r.artifact_excerpt ?? "", result: r };
-				},
-				runCode: async (cmd) => runCodeNode(cmd),
-			};
 			try {
-				const outcome = await runBlueprint(bp, p.vars ?? {}, exec);
-				const text = outcome.nodes
-					.map((n) => {
-						const head = `=== ${n.id} [${n.kind}${n.agent ? `:${n.agent}` : ""}] -> ${n.status} ===`;
-						if (n.status === "skipped")
-							return `${head}\nskipped (upstream not done: ${(n.skipped_by ?? []).join(", ")})`;
-						return `${head}\n${n.output.slice(0, 1200)}`;
-					})
-					.join("\n\n");
+				// Durable session: journal the run so a crash or approval-pause is discoverable + resumable.
+				const { session, runId } = startRun("blueprint", p.blueprint, { vars: p.vars ?? {} }, ctx);
+				const outcome = await executeBlueprint(bp, p.vars ?? {}, ctx, session);
 				const failed = outcome.nodes.some((n) => n.status === "failed" || n.status === "skipped");
-				return { content: [{ type: "text", text }], details: outcome, isError: failed };
+				return {
+					content: [{ type: "text", text: renderBlueprint(outcome, runId) }],
+					details: { ...outcome, runId },
+					isError: failed && !outcome.paused, // a paused run is not an error — it awaits approval
+				};
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				return {
@@ -379,6 +524,57 @@ export default function harness(summon: ExtensionAPI) {
 					details: undefined,
 				};
 			}
+		},
+	});
+
+	summon.registerTool({
+		name: "resume_run",
+		label: "Resume a durable run (crashed or approval-paused)",
+		description:
+			"Resume a durable blueprint/team run from its append-only event log: completed nodes are NOT " +
+			"re-run, granted approval gates are released. Run ids appear in the boot 'resumable-runs' event.",
+		parameters: Type.Object({ run_id: Type.String({ description: "the durable run id to resume" }) }),
+		async execute(_id: string, p: any, _s: any, _u: any, ctx: any) {
+			const r = await resumeRun(p.run_id, ctx);
+			return { content: [{ type: "text", text: r.text }], details: r.outcome, isError: r.isError };
+		},
+	});
+
+	summon.registerTool({
+		name: "approve_gate",
+		label: "Approve or deny a paused run's gate (human-in-the-loop)",
+		description:
+			"Decide a human-approval gate on a paused durable run. approved:true releases the gate and " +
+			"auto-resumes the run from where it paused; approved:false halts it. The gate id is the paused node's id.",
+		parameters: Type.Object({
+			run_id: Type.String(),
+			gate: Type.String({ description: "the gate id (the paused node's id)" }),
+			approved: Type.Boolean(),
+		}),
+		async execute(_id: string, p: any, _s: any, _u: any, ctx: any) {
+			const path = runEventsPath(RUNS_DIR, p.run_id);
+			if (!existsSync(path))
+				return {
+					content: [{ type: "text", text: `run '${p.run_id}' not found` }],
+					isError: true,
+					details: undefined,
+				};
+			const session = RunSession.resume(path);
+			session.append("approval_decided", { gate: p.gate, approved: !!p.approved });
+			if (!p.approved) {
+				session.append("run_finished", { status: "failed" });
+				return {
+					content: [{ type: "text", text: `gate '${p.gate}' DENIED — run ${p.run_id} halted` }],
+					isError: false,
+					details: undefined,
+				};
+			}
+			const r = await resumeRun(p.run_id, ctx); // auto-resume now that the gate is granted
+			return {
+				content: [{ type: "text", text: `gate '${p.gate}' APPROVED — resuming…\n\n${r.text}` }],
+				details: r.outcome,
+				isError: r.isError,
+			};
 		},
 	});
 
@@ -406,19 +602,35 @@ export default function harness(summon: ExtensionAPI) {
 		async execute(_id: string, p: any, _s: any, _u: any, ctx: any) {
 			const counts = new Map<string, number>();
 			for (const t of p.tasks) counts.set(t.agent, (counts.get(t.agent) ?? 0) + 1);
+			// Durable ledger: journal each task (node_started/node_done) so a crashed fan-out is discoverable.
+			const { session, runId } = startRun("fanout", "spawn_agents", {}, ctx);
+			const journal = journalOf(session);
 			const results = await Promise.all(
-				p.tasks.map((t: any, i: number) =>
-					runOne(
+				p.tasks.map(async (t: any, i: number) => {
+					const taskId = t.task_id ?? `${t.agent}-${i}`;
+					journal?.({ type: "node_started", node: taskId, agent: t.agent });
+					const r = await runOne(
 						t.agent,
 						t.prompt,
-						t.task_id ?? `${t.agent}-${i}`,
+						taskId,
 						ctx,
 						t.verify,
 						pickTransport(counts.get(t.agent) ?? 0, p.transport, isPrewarmed(t.agent)),
-					),
-				),
+					);
+					journal?.({
+						type: "node_done",
+						node: taskId,
+						status: r.status === "done" ? "done" : "failed",
+						output_excerpt: String(r.artifact_excerpt ?? "").slice(0, 1500),
+					});
+					return r;
+				}),
 			);
-			return { content: [{ type: "text", text: results.map(fmt).join("\n\n---\n\n") }], details: { results } };
+			if (session) session.append("run_finished", { status: "done" });
+			return {
+				content: [{ type: "text", text: results.map(fmt).join("\n\n---\n\n") }],
+				details: { results, runId },
+			};
 		},
 	});
 

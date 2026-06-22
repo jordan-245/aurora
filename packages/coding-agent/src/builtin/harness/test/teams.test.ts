@@ -177,3 +177,32 @@ test("loadTeams loads + validates from a temp dir fixture", () => {
 		rmSync(tmp, { recursive: true, force: true });
 	}
 });
+
+// ── durable journaling + resume (Phase 3) ──
+test("runTeam journals each step and skips already-done steps on resume", async () => {
+	const team: Team = {
+		name: "t",
+		stages: [[{ agent: "scout", prompt: "a" }], [{ agent: "builder", prompt: "b" }]],
+	};
+	const ran: string[] = [];
+	const events: any[] = [];
+	const runStep = async (agent: string) => {
+		ran.push(agent);
+		return { status: "done", artifact_excerpt: `${agent}-out` };
+	};
+	// Pass 1: full run, journaling every step.
+	await runTeam(team, {}, runStep, { journal: (e) => events.push(e) });
+	assert.deepEqual(ran, ["scout", "builder"]);
+	assert.ok(events.some((e) => e.type === "node_started" && e.node === "s0.0"));
+	assert.ok(events.some((e) => e.type === "node_done" && e.node === "s1.0" && e.status === "done"));
+
+	// Pass 2 (resume): step s0.0 recorded done → NOT re-run; only s1.0 executes.
+	ran.length = 0;
+	const out = await runTeam(team, {}, runStep, {
+		skipDone: new Set(["s0.0"]),
+		recorded: new Map([["s0.0", { status: "done", artifact_excerpt: "prior" }]]),
+	});
+	assert.deepEqual(ran, ["builder"], "only the not-yet-done step re-runs");
+	assert.equal(out.stages[0][0].resumed, true);
+	assert.equal(out.stages[0][0].result.artifact_excerpt, "prior");
+});

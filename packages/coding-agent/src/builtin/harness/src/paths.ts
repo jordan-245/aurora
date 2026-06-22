@@ -57,3 +57,6 @@ export const REGISTRY_INDEX = join(CONFIG_HOME, "harness", "registry-index.json"
 // Fleet-level observability (#8): cross-run spawn ledger + the rendered digest.
 export const FLEET_LEDGER = join(CONFIG_HOME, "harness", "fleet.jsonl");
 export const FLEET_SUMMARY = join(CONFIG_HOME, "harness", "fleet-summary.md");
+// Durable run sessions (the resumable/approvable spine): one append-only event log per run under
+// <runId>/events.jsonl, so a crashed/paused run can be discovered + resumed (Phase 2/3).
+export const RUNS_DIR = join(CONFIG_HOME, "harness", "runs");

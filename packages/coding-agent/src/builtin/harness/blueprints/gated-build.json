@@ -1,0 +1,23 @@
+{
+  "name": "gated-build",
+  "description": "Scout plans a change, a HUMAN approves, then a builder applies it and a deterministic node verifies. Demonstrates requires_approval (human-in-the-loop): the run pauses before the builder until approve_gate grants it. Vars: {{goal}}.",
+  "nodes": [
+    {
+      "id": "plan",
+      "agent": "scout",
+      "prompt": "Recon the codebase and propose the MINIMAL change for: {{goal}}. Return a numbered plan only.\n## findings\n## confidence"
+    },
+    {
+      "id": "apply",
+      "agent": "builder",
+      "depends_on": ["plan"],
+      "requires_approval": true,
+      "prompt": "Implement ONLY the approved plan below for: {{goal}}\n\nPlan:\n{{node.plan}}\n\nMake the smallest correct change; do not refactor unrelated code.\n## change-summary\n## verification"
+    },
+    {
+      "id": "check",
+      "depends_on": ["apply"],
+      "run": "echo 'replace this code node with your real deterministic check, e.g. npm test'"
+    }
+  ]
+}
