@@ -25,6 +25,9 @@ export interface BlueprintNode {
 	verify?: string; // optional deterministic acceptance check for an agent node
 	// code node:
 	run?: string;
+	// human-in-the-loop: a node so flagged will not launch until its approval gate is granted; the run
+	// PAUSES (durably) at that boundary and resumes once the gate is decided (see runBlueprint opts).
+	requires_approval?: boolean;
 }
 export interface Blueprint {
 	name: string;
@@ -49,7 +52,7 @@ export interface BlueprintExec {
 	runCode(cmd: string, node: BlueprintNode): Promise<NodeRun>;
 }
 
-export type NodeStatus = "pending" | "running" | "done" | "failed" | "skipped";
+export type NodeStatus = "pending" | "running" | "done" | "failed" | "skipped" | "awaiting_approval";
 export interface BlueprintNodeResult {
 	id: string;
 	kind: NodeKind;
@@ -64,6 +67,19 @@ export interface BlueprintNodeResult {
 export interface BlueprintOutcome {
 	name: string;
 	nodes: BlueprintNodeResult[];
+	// paused == the run hit a human-approval gate (or had unmet, already-granted-elsewhere gates) and
+	// stopped at a durable boundary. Resume by re-invoking runBlueprint with the journal's approvals.
+	paused?: boolean;
+	awaiting?: string[]; // node ids parked on an approval gate this run
+}
+
+// Durable/approval hooks for runBlueprint. ALL OPTIONAL — omitting `opts` is byte-for-byte the old
+// in-memory behaviour. `journal` is called as the DAG advances (write to a RunSession); `resume` seeds
+// already-completed nodes (skip re-running side effects); `isApproved` releases a node's approval gate.
+export interface BlueprintRunOpts {
+	journal?: (ev: { type: string; [k: string]: unknown }) => void;
+	resume?: { done?: Set<string>; failedOrSkipped?: Set<string>; output?: Map<string, string> };
+	isApproved?: (node: BlueprintNode) => boolean;
 }
 
 // ── validator (fail-closed at load, sentinel-style) ───────────────────────────
@@ -156,11 +172,33 @@ export async function runBlueprint(
 	bp: Blueprint,
 	vars: Record<string, string>,
 	exec: BlueprintExec,
+	opts: BlueprintRunOpts = {},
 ): Promise<BlueprintOutcome> {
 	const status = new Map<string, NodeStatus>(bp.nodes.map((n) => [n.id, "pending"]));
 	const output = new Map<string, string>();
 	const results = new Map<string, BlueprintNodeResult>();
 	const running = new Set<Promise<void>>();
+	const journal = opts.journal ?? (() => {});
+	const awaiting = new Set<string>();
+
+	// RESUME: seed already-terminal nodes from the durable log so we never re-run a completed node's
+	// side effects. Done nodes carry their recorded output forward for {{node.<id>}} templating.
+	if (opts.resume) {
+		for (const id of opts.resume.done ?? []) {
+			if (!status.has(id)) continue;
+			status.set(id, "done");
+			const out = opts.resume.output?.get(id) ?? "";
+			output.set(id, out);
+			const n = bp.nodes.find((x) => x.id === id)!;
+			results.set(id, { id, kind: nodeKind(n), status: "done", agent: n.agent, run: n.run, output: out });
+		}
+		for (const id of opts.resume.failedOrSkipped ?? []) {
+			if (!status.has(id) || status.get(id) === "done") continue;
+			status.set(id, "failed");
+			const n = bp.nodes.find((x) => x.id === id)!;
+			results.set(id, { id, kind: nodeKind(n), status: "failed", agent: n.agent, run: n.run, output: "" });
+		}
+	}
 
 	// Propagate skips transitively: a pending node whose any dep failed/was skipped is itself skipped.
 	const propagateSkips = (): void => {
@@ -196,6 +234,7 @@ export async function runBlueprint(
 		for (const d of n.depends_on ?? []) v[`node.${d}`] = output.get(d) ?? "";
 		const kind = nodeKind(n);
 		const filled = fillTemplate(kind === "code" ? n.run! : n.prompt!, v);
+		journal({ type: "node_started", node: n.id, kind, agent: n.agent });
 		const p = (async () => {
 			let run: NodeRun;
 			try {
@@ -215,9 +254,41 @@ export async function runBlueprint(
 				output: run.output ?? "",
 				result: run.result,
 			});
+			journal({
+				type: "node_done",
+				node: n.id,
+				status: run.ok ? "done" : "failed",
+				output_excerpt: (run.output ?? "").slice(0, 1500),
+			});
 		})();
 		running.add(p);
 		void p.finally(() => running.delete(p));
+	};
+
+	// A ready node gated by approval that has NOT been granted parks in `awaiting` (durable pause point)
+	// instead of launching. The gate id is the node id (one gate per gated node).
+	const gatedHeld = (n: BlueprintNode): boolean => {
+		if (!n.requires_approval) return false;
+		if (opts.isApproved?.(n)) return false; // gate granted (from the durable journal) → release
+		if (!awaiting.has(n.id)) {
+			awaiting.add(n.id);
+			status.set(n.id, "awaiting_approval");
+			results.set(n.id, {
+				id: n.id,
+				kind: nodeKind(n),
+				status: "awaiting_approval",
+				agent: n.agent,
+				run: n.run,
+				output: "",
+			});
+			journal({
+				type: "approval_requested",
+				gate: n.id,
+				node: n.id,
+				summary: (n.prompt ?? n.run ?? "").slice(0, 200),
+			});
+		}
+		return true;
 	};
 
 	for (;;) {
@@ -225,14 +296,18 @@ export async function runBlueprint(
 		const ready = bp.nodes.filter(
 			(n) => status.get(n.id) === "pending" && (n.depends_on ?? []).every((d) => status.get(d) === "done"),
 		);
-		for (const n of ready) launch(n);
+		const launchable = ready.filter((n) => !gatedHeld(n));
+		for (const n of launchable) launch(n);
 		if (running.size === 0) {
 			propagateSkips();
-			if (!bp.nodes.some((n) => status.get(n.id) === "pending")) break; // all terminal
-			break; // defensive: a validated acyclic graph never reaches here
+			// terminal == nothing pending AND nothing parked on an approval gate.
+			if (!bp.nodes.some((n) => status.get(n.id) === "pending") && awaiting.size === 0) break;
+			break; // no work in flight: either all terminal, or PAUSED on approval gate(s)
 		}
 		await Promise.race(running);
 	}
 
-	return { name: bp.name, nodes: bp.nodes.map((n) => results.get(n.id)!) };
+	const paused = awaiting.size > 0;
+	if (paused) journal({ type: "run_finished", status: "paused" });
+	return { name: bp.name, nodes: bp.nodes.map((n) => results.get(n.id)!), paused, awaiting: [...awaiting] };
 }
