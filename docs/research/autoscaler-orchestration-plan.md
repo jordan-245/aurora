@@ -474,8 +474,8 @@ per-operator. **No flag becomes default-on in this roadmap** — that's a separa
 |------|---------|--------|
 | `HARNESS_WINDOW_RESERVE` | off | reserved tokens count toward the window gate (else surfaced only) |
 | `HARNESS_POOL_MIN` / `HARNESS_POOL_MAX` | `=POOL_SIZE` | elastic band; `MIN=0` ⇒ scale-to-zero |
-| `HARNESS_AUTOSCALE` | **observe-only ON** (`=0` to disable) | arm FleetController telemetry (never mutates pools) |
-| `HARNESS_AUTOSCALE_ACT` | off | enable actuation (resize pools + load-shed) |
+| `HARNESS_AUTOSCALE` | **observe ON** (`=0` to disable) | arm FleetController telemetry |
+| `HARNESS_AUTOSCALE_ACT` | **actuation ON** (`=0` for observe-only) | resize pools to demand + pool-route concurrent spawns (load-shed only with a window budget) |
 | `HARNESS_AUTOSCALE_TICK_MS` / `_MAX` / `_SHED_PCT` | 2000 / 16 / 90 | controller tuning |
 | `HARNESS_SCALE` | `auto` | `auto\|eco\|turbo\|fixed:N` |
 | `HARNESS_GAUGE` | on | governor-gauge kill-switch |
@@ -558,14 +558,24 @@ two layers — deterministic guards (CI-safe, exit non-zero on regression, wired
   queued + speculative_slot, 0, cap)`, prewarm on cold start, precise shrink+reap on drain, cooldown
   suppresses thrash. Real observe-only run over the live pool: targets tracked actual occupancy
   (busy 8 ⇒ target 8, drained precisely), no oscillation.
-- **B3 — observe-only graduated to default-on (operator decision, 2026-06-22).** With B1/B2 passed,
-  the first graduation step is taken: `HARNESS_AUTOSCALE` now defaults to **observe-only ON**
-  (`HARNESS_AUTOSCALE !== "0"`). Observe-only emits fleet telemetry + powers the dashboard fleet panel
-  but **never** mutates pools, sheds load, or changes transport routing — spawn behaviour is
-  byte-for-byte unchanged, so this is a pure-observability default. Opt out with `HARNESS_AUTOSCALE=0`.
-  - **Jitter guard (required for the flip):** the controller now drops all-hold/all-zero ticks, so an
-    idle session emits nothing and the observe extension never repaints when idle — the idle-jutter
-    invariant holds under the new default (covered by an e2e idle-silence test).
-  - **Actuation stays OPT-IN.** `HARNESS_AUTOSCALE_ACT=1` (pool resize + load-shed) remains off by
-    default; graduating it is the next explicit decision, to be taken after observe-only telemetry from
-    real workloads (now collected by default) confirms the targets in production.
+- **B3 — observe AND actuation graduated to default-on (operator decisions, 2026-06-22).** Both layers
+  now default on: `HARNESS_AUTOSCALE !== "0"` (telemetry) and `HARNESS_AUTOSCALE_ACT !== "0"`
+  (actuation). Opt out per layer with `HARNESS_AUTOSCALE=0` (all off) or `HARNESS_AUTOSCALE_ACT=0`
+  (observe-only).
+  - **What actuation does by default:** resizes warm pools to demand (grow/prewarm/shrink, bounded by
+    `maxPerBundle` and still gated by the governor's weight cap) and routes *concurrent* spawns to the
+    warm pool. Lone `spawn_agent` calls and `spawn_agents` batches are unchanged (a single spawn sees
+    demand <2 → oneshot; batches keep the bench-validated `POOL_MIN_BATCH=8` heuristic, which wins over
+    `routeTransport` because it is passed as an explicit transport).
+  - **Load-shed is INERT by default.** Tier-downshift fires only when `windowPct ≥ shedAtPct` (90), and
+    `windowPct()` is 0 unless a hard budget is set (`HARNESS_WINDOW_TOKENS>0`). So actuation-on does NOT
+    silently degrade output quality on a default install; an operator opts into shedding by configuring
+    a window budget. (E2e-covered with `shedAtPct=0`.)
+  - **Jitter guard:** the controller drops all-hold/all-zero ticks, so idle sessions stay byte-silent
+    (no repaint) under both layers — e2e idle-silence test.
+  - **Honest deviation from the pre-registered gate:** the roadmap sequenced actuation *after* a
+    real-workload observe-only telemetry soak. That soak has NOT happened (observe-only was enabled the
+    same day); actuation was graduated by explicit operator directive ahead of it. Risk is mitigated by
+    the deterministic B1/B2 guards, the real B1/B2 runs, e2e actuation coverage (real spawn + real pool
+    + real controller via the faithful rpc fake), the governor/`maxPerBundle` bounds, and shed being
+    inert without a budget — but the production soak remains the recommended follow-up validation.

@@ -82,6 +82,7 @@ before(async () => {
 	process.env.SUMMON_CODING_AGENT_DIR = configDir;
 	process.env.HARNESS_DURABLE = "1";
 	process.env.HARNESS_NO_CACHE = "1"; // each spawn really runs (no within-run cache short-circuit)
+	process.env.HARNESS_AUTOSCALE_ACT = "0"; // actuation OFF by default in tests; the actuation/shedding cases opt in
 	process.chdir(projectDir);
 
 	harness = (await import("../extension/spawn-agent.ts")).default;
@@ -98,8 +99,7 @@ after(() => {
 // ── spawn_agent: the real subprocess round-trip ─────────────────────────────────
 
 test("e2e spawn_agent: drives the fake CLI subprocess and returns a done result", async () => {
-	delete process.env.HARNESS_AUTOSCALE;
-	delete process.env.HARNESS_AUTOSCALE_ACT;
+	delete process.env.HARNESS_AUTOSCALE; // observe-only ON (default); actuation inherits "0" from before()
 	const { api, tools, runShutdown } = makeSummon();
 	harness(api);
 	try {
@@ -116,7 +116,7 @@ test("e2e spawn_agent: drives the fake CLI subprocess and returns a done result"
 
 test("e2e observe-only default: idle emits NO autoscale events (jitter-safe); demand surfaces them", async () => {
 	delete process.env.HARNESS_AUTOSCALE; // default ⇒ observe-only ON
-	delete process.env.HARNESS_AUTOSCALE_ACT; // actuation stays OFF
+	process.env.HARNESS_AUTOSCALE_ACT = "0"; // actuation explicitly OFF — this is the observe-only case
 	process.env.HARNESS_AUTOSCALE_TICK_MS = "25"; // fast ticks so several elapse during the test
 	const { api, tools, events, runShutdown } = makeSummon();
 	harness(api);
@@ -135,6 +135,33 @@ test("e2e observe-only default: idle emits NO autoscale events (jitter-safe); de
 	} finally {
 		delete process.env.HARNESS_AUTOSCALE_TICK_MS;
 		await runShutdown();
+	}
+});
+
+// ── actuation is ON BY DEFAULT (B3): a concurrent burst grows a warm pool, then quiesces ────────
+
+test("e2e actuation default-on: concurrent burst routes to the warm pool and the controller actuates", async () => {
+	delete process.env.HARNESS_AUTOSCALE; // observe ON
+	delete process.env.HARNESS_AUTOSCALE_ACT; // → actuation ON by default (the flip under test)
+	process.env.HARNESS_AUTOSCALE_TICK_MS = "25";
+	const { api, tools, events, runShutdown } = makeSummon();
+	harness(api);
+	try {
+		// 6 same-bundle tasks forced through the warm rpc pool (exercises the faithful fake rpc transport).
+		const tasks = Array.from({ length: 6 }, (_v, i) => ({ agent: "tester", prompt: `burst ${i}` }));
+		const r = await tools.get("spawn_agents").execute("id", { tasks, transport: "pool" }, null, null, ctx);
+		assert.equal(r.isError ?? false, false);
+		assert.equal((r.content[0].text.match(/tester → done/g) ?? []).length, 6, "all 6 completed via the pool");
+		// the actuating controller made at least one real scaling decision (prewarm/grow) under the burst.
+		const actions = events.filter((e) => e.t === "autoscale").flatMap((e: any) => e.ticks.map((t: any) => t.action));
+		assert.ok(
+			actions.some((a: string) => a === "prewarm" || a === "grow"),
+			`actuation should grow/prewarm the pool under load; saw actions: ${[...new Set(actions)].join(",") || "(none)"}`,
+		);
+	} finally {
+		delete process.env.HARNESS_AUTOSCALE_TICK_MS;
+		process.env.HARNESS_AUTOSCALE_ACT = "0"; // restore the file default for later tests
+		await runShutdown(); // stops the fleet timer + drains the warm pool
 	}
 });
 

@@ -166,13 +166,16 @@ export default function harness(summon: ExtensionAPI) {
 			)
 			.catch(() => {});
 	}
-	// ── autoscaler (#3): a demand-driven control loop over the governor + warm pools. OBSERVE-ONLY is
-	//    ON BY DEFAULT (B3 graduation, 2026-06-22 — validated by bench/: targets track demand, no thrash):
-	//    it emits fleet telemetry + powers the dashboard's fleet panel but NEVER mutates pools, sheds, or
-	//    changes transport routing, so spawn behaviour is byte-for-byte unchanged. ACTUATION stays opt-in
-	//    (HARNESS_AUTOSCALE_ACT=1 → resize pools + load-shed). Opt out of observe-only with HARNESS_AUTOSCALE=0.
+	// ── autoscaler (#3): a demand-driven control loop over the governor + warm pools. Both layers are
+	//    ON BY DEFAULT (B3 graduation, 2026-06-22; validated by bench/). OBSERVE (HARNESS_AUTOSCALE!=0)
+	//    emits fleet telemetry + powers the dashboard. ACTUATION (HARNESS_AUTOSCALE_ACT!=0) additionally
+	//    resizes warm pools to demand (grow/prewarm/shrink, bounded by maxPerBundle + the governor) and
+	//    routes concurrent spawns to the warm pool. Load-shedding (tier-downshift) is part of actuation but
+	//    stays INERT unless a window budget is configured (HARNESS_WINDOW_TOKENS>0 → windowPct can reach
+	//    shedAtPct); with the default budget 0, windowPct()==0 < 90 so actuation never degrades a tier.
+	//    Opt out per layer: HARNESS_AUTOSCALE=0 (all off) or HARNESS_AUTOSCALE_ACT=0 (observe-only).
 	const AUTOSCALE = process.env.HARNESS_AUTOSCALE !== "0";
-	const AUTOSCALE_ACT = process.env.HARNESS_AUTOSCALE_ACT === "1";
+	const AUTOSCALE_ACT = process.env.HARNESS_AUTOSCALE_ACT !== "0";
 	// Live per-bundle demand for the controller: inflight = admitted & running; waiting = queued on the
 	// governor; arrival rate/trend = a real rolling-window signal (A6) so computeTarget's speculative slot
 	// and prewarm-on-rising-demand actually fire instead of seeing a hardcoded 0.

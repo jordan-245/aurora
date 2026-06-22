@@ -60,9 +60,13 @@ if (!isRpc) {
 	process.stdout.write(messageEndLine(answerFor(prompt)));
 	process.exit(0);
 } else {
-	// rpc worker: one message_end reply per `run` request line; exit on stream close.
+	// rpc worker: speak the exact protocol RpcWorker (src/rpc-worker.ts) expects from a real
+	// `summon --mode rpc` server, so the warm-pool transport works end-to-end:
+	//   {type:"prompt", message, id}  → {type:"response", id, success:true} + message_end + agent_end
+	//   {type:"new_session", id}      → {type:"response", id, success:true}   (WarmPool.release reset)
 	process.stdin.setEncoding("utf8");
 	let buf = "";
+	const write = (o) => process.stdout.write(`${JSON.stringify(o)}\n`);
 	process.stdin.on("data", (d) => {
 		buf += d;
 		let nl = buf.indexOf("\n");
@@ -77,8 +81,15 @@ if (!isRpc) {
 			} catch {
 				continue;
 			}
-			const prompt = String(req?.prompt ?? req?.message ?? req?.text ?? "");
-			if (req?.type === "run" || prompt) process.stdout.write(messageEndLine(answerFor(prompt)));
+			if (req?.type === "prompt") {
+				write({ type: "response", id: req.id, success: true });
+				const text = answerFor(String(req.message ?? ""));
+				write({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } });
+				write({ type: "agent_end" });
+			} else if (req?.id) {
+				// new_session and any other id-correlated command: acknowledge so the worker stays healthy.
+				write({ type: "response", id: req.id, success: true });
+			}
 		}
 	});
 	process.stdin.on("end", () => process.exit(0));
