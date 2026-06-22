@@ -22,9 +22,10 @@ export default function observe(summon: ExtensionAPI) {
 	let anim: any;
 	let surface: WebSurface | undefined;
 	// Pluggable dashboard layout (#layout): HARNESS_DASHBOARD picks the initial mode; /harness-layout switches live.
+	// Default is hardcoded to "command-bridge" (the ops console); HARNESS_DASHBOARD still overrides it.
 	let dashStyle: DashboardStyle = (DASHBOARD_STYLES as string[]).includes(process.env.HARNESS_DASHBOARD ?? "")
 		? (process.env.HARNESS_DASHBOARD as DashboardStyle)
-		: "panel";
+		: "command-bridge";
 
 	// animation loop: advance the frame so running agents spin + the splash wordmark shimmers (~120ms).
 	// CRITICAL: this MUST go fully quiet when idle. An always-on "idle shimmer" repaints the bottom

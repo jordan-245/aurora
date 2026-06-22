@@ -2,7 +2,7 @@
 //   node --experimental-strip-types --test test/core.test.ts
 
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, rmSync, writeFileSync as writeFile } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync as writeFile } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -15,6 +15,7 @@ import {
 	buildWorkerArgs,
 	candidateKey,
 	checkContract,
+	DEFAULT_AUTH_EXTENSION,
 	estimateTokens,
 	finalizeResult,
 	forceOAuthRouting,
@@ -76,11 +77,13 @@ test("buildWorkerArgs carries the mode head, model, system prompt, and tool allo
 });
 
 test("buildWorkerArgs loads the write-guard only for write/exec-capable workers", () => {
-	// Pass an explicit empty env so ambient SUMMON_AUTH_EXTENSIONS can't inject a stray -e and bleed in.
-	const readOnly = buildWorkerArgs({ ...base, tools: ["read"] }, ["-p"], {});
+	// Explicitly disable the hardcoded default auth extension (SUMMON_AUTH_EXTENSIONS="") so neither the
+	// ambient env nor the default can inject a stray -e and bleed in.
+	const noAuth = { SUMMON_AUTH_EXTENSIONS: "" };
+	const readOnly = buildWorkerArgs({ ...base, tools: ["read"] }, ["-p"], noAuth);
 	assert.ok(!readOnly.includes("-e"), "read-only worker must not load the guard extension");
 	for (const tool of ["bash", "write", "edit"]) {
-		const args = buildWorkerArgs({ ...base, tools: ["read", tool] }, ["-p"], {});
+		const args = buildWorkerArgs({ ...base, tools: ["read", tool] }, ["-p"], noAuth);
 		assert.ok(args.includes("-e"), `${tool}-capable worker must load the guard extension`);
 	}
 });
@@ -694,8 +697,9 @@ test("assertSpawnAuth allows an API key by default but fails closed when OAuth i
 	);
 	// Forced OAuth, key ejected, but NO auth extension declared: the sealed worker has no credential
 	// path, so spawning must fail closed (loud) rather than silently emit "No API key" + 0 bytes.
+	// (SUMMON_AUTH_EXTENSIONS="" explicitly opts out of the hardcoded default so there is truly none.)
 	assert.throws(
-		() => assertSpawnAuth({ SUMMON_FORCE_OAUTH_ROUTING: "1" }, SYS_HEADER),
+		() => assertSpawnAuth({ SUMMON_FORCE_OAUTH_ROUTING: "1", SUMMON_AUTH_EXTENSIONS: "" }, SYS_HEADER),
 		/no credential path|SUMMON_AUTH_EXTENSIONS/,
 	);
 	// Forced OAuth WITH a resolvable auth extension declared: the worker can authenticate -> allowed.
@@ -718,8 +722,10 @@ test("authExtensions resolves declared credential paths and survives the worker 
 	writeFile(b, "export default () => {};");
 	const missing = join(dir, "nope.ts");
 
-	// Empty / unset -> none.
-	assert.deepEqual(authExtensions({}), []);
+	// Unset -> the hardcoded default credential provider (gated by existence on disk).
+	assert.deepEqual(authExtensions({}), existsSync(DEFAULT_AUTH_EXTENSION) ? [DEFAULT_AUTH_EXTENSION] : []);
+	// Explicit empty string -> opt out of the default entirely.
+	assert.deepEqual(authExtensions({ SUMMON_AUTH_EXTENSIONS: "" }), []);
 	// JSON array form (robust to path separators).
 	assert.deepEqual(authExtensions({ SUMMON_AUTH_EXTENSIONS: JSON.stringify([a, b]) }), [a, b]);
 	// Delimiter/comma-separated form, with a missing path silently dropped.

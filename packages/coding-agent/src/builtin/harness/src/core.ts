@@ -295,8 +295,12 @@ export function spawnEnv(root?: string, protectedList?: string[]): NodeJS.Proces
 // path separators) or a path.delimiter/comma-separated list. Missing paths are dropped (loud, via
 // warn) so a stale entry can't wedge spawning; assertSpawnAuth() fails closed when forced-OAuth is
 // on and NONE resolve, turning the old silent "No API key" 0-byte failure into an actionable error.
+// Hardcoded default credential provider: when SUMMON_AUTH_EXTENSIONS is unset, fall back to the
+// canonical Anthropic OAuth extension so forced-OAuth spawning works out of the box. Setting
+// SUMMON_AUTH_EXTENSIONS still fully overrides this default.
+export const DEFAULT_AUTH_EXTENSION = "/root/.summon/extensions/anthropic-oauth/index.ts";
 export function authExtensions(env: NodeJS.ProcessEnv = process.env): string[] {
-	const raw = (env.SUMMON_AUTH_EXTENSIONS ?? "").trim();
+	const raw = (env.SUMMON_AUTH_EXTENSIONS ?? DEFAULT_AUTH_EXTENSION).trim();
 	if (!raw) return [];
 	let candidates: string[];
 	if (raw.startsWith("[")) {
