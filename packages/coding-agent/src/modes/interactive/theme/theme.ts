@@ -1036,9 +1036,10 @@ export class Theme {
 	}
 
 	/**
-	 * Constellation Forge banner — the wordmark assembles from star-points and connecting lines,
-	 * then solidifies into glyphs in ice-blue→violet. Loops seamlessly: the star field twinkles,
-	 * constellation lines pulse gently, and the gradient drifts across the solidified wordmark.
+	 * Constellation Forge banner — the wordmark glows in a drifting ice-blue→violet gradient while
+	 * a bright glint sweeps left-to-right across the glyphs and a twinkling star field breathes in
+	 * the margin rows. Constellation lines (within individual letters only) pulse in sync.
+	 * 64-frame seamless loop at 75 ms/frame (~4.8 s cycle).
 	 *
 	 * Terminal-adaptive: the frame grid is exactly the wordmark dimensions (no fixed padding) so
 	 * it behaves identically to the comet banner and is safely clipped by the TUI header widget.
@@ -1060,6 +1061,10 @@ export class Theme {
 		for (let r = 0; r < H; r++)
 			for (let c = 0; c < rows[r].length; c++) if (rows[r][c] !== " ") filled.push({ r, c, ch: rows[r][c] });
 
+		// Separator columns: fully blank across all rows → letter boundaries.
+		// Used to prevent constellation lines from bridging between different letters.
+		const isSeparatorCol = Array.from({ length: W }, (_, c) => rows.every((row) => (row[c] ?? " ") === " "));
+
 		// Star field — stable, seeded positions that twinkle each frame
 		let seed = 0xdeadbeef >>> 0;
 		const prng = () => {
@@ -1072,34 +1077,44 @@ export class Theme {
 		const GR = H + 2 * PAD;
 		const GC = W;
 
-		const STAR_COUNT = Math.min(60, Math.floor(GR * GC * 0.04));
+		// More stars, placed only in the padding rows so they never collide with the wordmark.
+		const STAR_COUNT = Math.min(80, Math.floor(4 * GC * 0.18));
 		const stars = Array.from({ length: STAR_COUNT }, () => ({
-			r: Math.floor(prng() * GR),
+			r: Math.floor(prng() * (2 * PAD)) < PAD ? Math.floor(prng() * PAD) : PAD + H + Math.floor(prng() * PAD),
 			c: Math.floor(prng() * GC),
-			mag: prng(),
+			mag: 0.4 + prng() * 0.6, // bias toward brighter stars
 			twk: prng(),
-			ch: [".", "·", "∙", "*", "✦", "✧"][Math.floor(prng() * 6)],
+			ch: ["·", "∙", "*", "✦", "✧", "✦"][Math.floor(prng() * 6)],
 		}));
 
-		// Per-filled-cell stable random magnitude for twinkling star-dots
-		const cellMag = new Map<string, number>();
-		for (const { r, c } of filled) cellMag.set(`${r},${c}`, prng());
+		// Per-filled-cell stable random phase offset for the glint ripple
+		const cellPhaseOffset = new Map<string, number>();
+		for (const { r, c } of filled) cellPhaseOffset.set(`${r},${c}`, prng() * 0.15);
 
 		const wrap = (x: number) => ((x % 1) + 1) % 1;
 
-		// Horizontal connecting lines within a row between adjacent filled cells
+		// Constellation lines strictly within letters — gap must not cross a separator column.
 		const rowConnections: Array<{ r: number; c1: number; c2: number }> = [];
 		for (let r = 0; r < H; r++) {
 			const cells = filled.filter((p) => p.r === r).sort((a, b) => a.c - b.c);
 			for (let i = 0; i < cells.length - 1; i++) {
-				const gap = cells[i + 1].c - cells[i].c;
-				if (gap > 0 && gap <= 4)
-					// only within a letter — skip inter-letter gaps
-					rowConnections.push({ r, c1: cells[i].c, c2: cells[i + 1].c });
+				const c1 = cells[i].c;
+				const c2 = cells[i + 1].c;
+				const gap = c2 - c1;
+				if (gap <= 0 || gap > 4) continue;
+				// Skip if any intermediate column is a letter separator
+				let crossesBoundary = false;
+				for (let dc = 1; dc < gap; dc++) {
+					if (isSeparatorCol[c1 + dc]) {
+						crossesBoundary = true;
+						break;
+					}
+				}
+				if (!crossesBoundary) rowConnections.push({ r, c1, c2 });
 			}
 		}
 
-		const frameCount = 64; // ~4.8s at 75ms
+		const frameCount = 64; // ~4.8 s at 75 ms
 		const frames: string[] = [];
 
 		for (let f = 0; f < frameCount; f++) {
@@ -1111,35 +1126,40 @@ export class Theme {
 				grid[r * GC + c] = { ch, col };
 			};
 
-			// (1) Ambient star field — twinkle
+			// (1) Ambient star field — dramatic breathing: stars cycle fully off/on
 			for (const s of stars) {
-				const brightness = s.mag * (0.35 + 0.28 * Math.sin((phase + s.twk) * Math.PI * 4.5));
-				if (brightness < 0.08) continue;
+				// Wide amplitude (0 → mag) so stars visibly appear and disappear
+				const brightness = s.mag * Math.max(0, Math.sin((phase + s.twk) * Math.PI * 3));
+				if (brightness < 0.06) continue;
 				const t = Math.max(0, Math.min(1, s.mag));
 				const col = this.gradientAt(t, ["#6db4ff", "#8b95ff", "#eef1ff"]);
-				const scaled = this.mixHex("#0a0b14", col, brightness * 1.4);
+				const scaled = this.mixHex("#0a0b14", col, Math.min(1, brightness * 1.6));
 				setCell(s.r, s.c, s.ch, scaled);
 			}
 
-			// (2) Constellation lines — pulse gently
+			// (2) Constellation lines — visibly pulse in brightness
 			for (const { r, c1, c2 } of rowConnections) {
-				const linePulse = 0.28 + 0.18 * Math.sin(phase * Math.PI * 2 + c1 * 0.4);
+				const linePulse = 0.2 + 0.45 * Math.abs(Math.sin(phase * Math.PI * 2 + c1 * 0.35));
 				for (let dc = 1; dc < c2 - c1; dc++) {
-					const t = wrap((c1 + dc) / W + phase * 0.5);
+					const t = wrap((c1 + dc) / W + phase * 0.8);
 					const col = this.gradientAt(t, ["#34e1f4", "#6db4ff", "#8b95ff"], true);
 					setCell(PAD + r, c1 + dc, "─", this.mixHex("#0a0b14", col, linePulse));
 				}
 			}
 
-			// (3) Wordmark — solid glyphs with drifting constellation gradient
+			// (3) Wordmark — fast-drifting gradient (2.5 full cycles per loop = clearly visible)
+			//     plus a sweeping glint (bright highlight that crosses the banner once per loop).
+			const glintCol = wrap(phase) * W; // glint position: 0→W over the loop
+			const GLINT_HALF = 4; // half-width of the glint beam in columns
 			for (const { r, c, ch } of filled) {
-				// Drift: gradient moves right slowly; each letter has a subtle phase offset
-				const gp = wrap(c / W + phase * 1.1);
+				// Fast drift: 2.5 cycles so the full-spectrum sweep is always visible
+				const phaseOffset = cellPhaseOffset.get(`${r},${c}`) ?? 0;
+				const gp = wrap(c / W + phase * 2.5 + phaseOffset);
 				const baseCol = this.gradientAt(gp, ["#34e1f4", "#8b95ff", "#b69cff", "#f06ffb"], true);
-				// Gentle per-cell twinkle — star-like glint on filled glyphs
-				const mag = cellMag.get(`${r},${c}`) ?? 0.5;
-				const twinkle = 1 + 0.22 * Math.sin(phase * Math.PI * 4.5 + c * 0.5 + mag * 6);
-				const col = this.mixHex(baseCol, "#ffffff", Math.min(0.5, (twinkle - 1) * 0.8));
+				// Glint: Gaussian-shaped brightness boost centred on glintCol
+				const dist = Math.abs(c - glintCol);
+				const glintAlpha = dist < GLINT_HALF ? Math.exp(-(dist * dist) / (GLINT_HALF * GLINT_HALF * 0.5)) : 0;
+				const col = this.mixHex(baseCol, "#ffffff", Math.min(0.75, glintAlpha * 0.7));
 				setCell(PAD + r, c, ch, col);
 			}
 
