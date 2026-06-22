@@ -6,7 +6,15 @@
 // Dependency direction: core ← pool ← rpc-worker ← pool-transport ← extension
 //                                                                   ↑ only the extension
 //                                                                     imports this module
-import { type AgentBundle, finalizeResult, MODEL, retryPrompt, type SpawnResult, withRetry } from "./core.ts";
+import {
+	type AgentBundle,
+	agentTimeoutMs,
+	finalizeResult,
+	MODEL,
+	retryPrompt,
+	type SpawnResult,
+	withRetry,
+} from "./core.ts";
 import { type PoolStats, WarmPool } from "./pool.ts";
 import { RpcWorker } from "./rpc-worker.ts";
 
@@ -123,7 +131,7 @@ async function poolRun(bundle: AgentBundle, prompt: string, opts: PoolOpts): Pro
 	const pool = poolFor(bundle, opts);
 	const w = await pool.acquire();
 	try {
-		const r = await w.run(prompt, (bundle.timeout_s ?? 600) * 1000);
+		const r = await w.run(prompt, agentTimeoutMs(bundle));
 		return finalizeResult(bundle, r.text, r.ok ? 0 : 1, opts, t0, model);
 	} finally {
 		await pool.release(w); // reset() = new_session → clean context for the next task

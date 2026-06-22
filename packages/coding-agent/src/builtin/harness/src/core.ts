@@ -768,6 +768,18 @@ export function buildWorkerArgs(bundle: AgentBundle, head: string[], env: NodeJS
 	return args;
 }
 
+// SIGKILL deadline (ms) for a spawned worker. The agent definition's timeout_s is the per-agent
+// intent; SUMMON_AGENT_TIMEOUT_S (seconds, set at launch) raises it to a global FLOOR so a long task
+// (e.g. a deep audit) isn't cut off without re-editing every agent.json. It only ever EXTENDS — an
+// agent already configured longer than the floor keeps its own value. Both spawn transports route
+// through this so they can't drift.
+export function agentTimeoutMs(bundle: { timeout_s?: number }, env: NodeJS.ProcessEnv = process.env): number {
+	const base = bundle.timeout_s ?? 600;
+	const floor = Number(env.SUMMON_AGENT_TIMEOUT_S);
+	const sec = Number.isFinite(floor) && floor > 0 ? Math.max(base, floor) : base;
+	return sec * 1000;
+}
+
 // ── spawn one worker via `summon -p --mode json` (the proven transport) ───────────
 export function spawnOnce(
 	bundle: AgentBundle,
@@ -792,7 +804,7 @@ export function spawnOnce(
 		const child = spawn(cmd, [...prefix, ...args], { env });
 		let text = "",
 			buf = "";
-		const killer = setTimeout(() => child.kill("SIGKILL"), (bundle.timeout_s ?? 600) * 1000);
+		const killer = setTimeout(() => child.kill("SIGKILL"), agentTimeoutMs(bundle));
 		child.stdin.write(prompt);
 		child.stdin.end();
 		child.stdout.on("data", (d) => {
