@@ -11,6 +11,7 @@ import {
 	appendExpertiseNote,
 	assertSpawnAuth,
 	buildSystemPrompt,
+	buildWorkerArgs,
 	checkContract,
 	estimateTokens,
 	finalizeResult,
@@ -30,6 +31,7 @@ import {
 	spawnEnv,
 	validateBundle,
 	WindowGovernor,
+	WORKER_SEAL_FLAGS,
 	withRetry,
 	writeRegistryIndex,
 } from "../src/core.ts";
@@ -41,6 +43,41 @@ const base: AgentBundle = {
 	tools: ["read"],
 	output_contract: { required_sections: ["## a"] },
 };
+
+// ── worker spawn argv: seal + transport parity ──────────────────────────────────
+// These lock the structural guarantee that EVERY spawned worker is sealed (no
+// extension/skill/prompt/theme/context discovery) so a future edit can't silently
+// unseal a sub-agent. Both transports must route through buildWorkerArgs.
+
+test("buildWorkerArgs seals every worker against ambient discovery", () => {
+	const args = buildWorkerArgs(base, ["-p", "--no-session", "--mode", "json"]);
+	for (const flag of WORKER_SEAL_FLAGS) assert.ok(args.includes(flag), `missing seal flag ${flag}`);
+	// The seal must cover discovery of extensions, skills, prompts, themes, and context files.
+	assert.deepEqual([...WORKER_SEAL_FLAGS].sort(), [
+		"--no-context-files",
+		"--no-extensions",
+		"--no-prompt-templates",
+		"--no-skills",
+		"--no-themes",
+	]);
+});
+
+test("buildWorkerArgs carries the mode head, model, system prompt, and tool allowlist", () => {
+	const args = buildWorkerArgs({ ...base, tools: ["read", "grep"] }, ["--mode", "rpc", "--no-session"]);
+	assert.deepEqual(args.slice(0, 3), ["--mode", "rpc", "--no-session"]);
+	assert.equal(args[args.indexOf("--tools") + 1], "read,grep");
+	assert.ok(args.includes("--system-prompt"));
+	assert.ok(args.includes("--model"));
+});
+
+test("buildWorkerArgs loads the write-guard only for write/exec-capable workers", () => {
+	const readOnly = buildWorkerArgs({ ...base, tools: ["read"] }, ["-p"]);
+	assert.ok(!readOnly.includes("-e"), "read-only worker must not load the guard extension");
+	for (const tool of ["bash", "write", "edit"]) {
+		const args = buildWorkerArgs({ ...base, tools: ["read", tool] }, ["-p"]);
+		assert.ok(args.includes("-e"), `${tool}-capable worker must load the guard extension`);
+	}
+});
 
 test("valid bundle passes", () => {
 	assert.doesNotThrow(() => validateBundle(base));

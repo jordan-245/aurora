@@ -7,22 +7,8 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import * as _bundledPiAgentCore from "@summon/agent-core";
-import * as _bundledPiAi from "@summon/ai";
-import * as _bundledPiAiOauth from "@summon/ai/oauth";
 import type { KeyId } from "@summon/tui";
-import * as _bundledPiTui from "@summon/tui";
-import { createJiti } from "jiti/static";
-// Static imports of packages that extensions may use.
-// These MUST be static so Bun bundles them into the compiled binary.
-// The virtualModules option then makes them available to extensions.
-import * as _bundledTypebox from "typebox";
-import * as _bundledTypeboxCompile from "typebox/compile";
-import * as _bundledTypeboxValue from "typebox/value";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.ts";
-// NOTE: This import works because loader.ts exports are NOT re-exported from index.ts,
-// avoiding a circular dependency. Extensions can import from @summon/coding-agent.
-import * as _bundledPiCodingAgent from "../../index.ts";
 import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
@@ -40,20 +26,48 @@ import type {
 	ToolDefinition,
 } from "./types.ts";
 
-/** Modules available to extensions via virtualModules (for compiled Bun binary) */
-const VIRTUAL_MODULES: Record<string, unknown> = {
-	typebox: _bundledTypebox,
-	"typebox/compile": _bundledTypeboxCompile,
-	"typebox/value": _bundledTypeboxValue,
-	"@sinclair/typebox": _bundledTypebox,
-	"@sinclair/typebox/compile": _bundledTypeboxCompile,
-	"@sinclair/typebox/value": _bundledTypeboxValue,
-	"@summon/agent-core": _bundledPiAgentCore,
-	"@summon/tui": _bundledPiTui,
-	"@summon/ai": _bundledPiAi,
-	"@summon/ai/oauth": _bundledPiAiOauth,
-	"@summon/coding-agent": _bundledPiCodingAgent,
-};
+/**
+ * Modules available to extensions via virtualModules (compiled Bun binary path only).
+ *
+ * These are loaded LAZILY — only when a TypeScript extension is actually loaded
+ * AND we are running as a Bun binary. Importing them statically at module top
+ * forced the entire bundled package surface (typebox's ~700 submodules, the
+ * @summon/coding-agent barrel — which re-exports the interactive TUI — jiti, etc.)
+ * to load at boot for EVERY invocation, because the extension loader is reached
+ * during normal resource loading. In Node/dev the alias branch is used instead,
+ * so this is never even called there. The dynamic import() specifiers are literal,
+ * so Bun still statically bundles them into the compiled binary.
+ */
+let _virtualModules: Record<string, unknown> | null = null;
+async function getVirtualModules(): Promise<Record<string, unknown>> {
+	if (_virtualModules) return _virtualModules;
+	const [typebox, typeboxCompile, typeboxValue, agentCore, tui, ai, aiOauth, codingAgent] = await Promise.all([
+		import("typebox"),
+		import("typebox/compile"),
+		import("typebox/value"),
+		import("@summon/agent-core"),
+		import("@summon/tui"),
+		import("@summon/ai"),
+		import("@summon/ai/oauth"),
+		// NOTE: importing the @summon/coding-agent barrel works because loader.ts
+		// exports are NOT re-exported from index.ts, avoiding a circular dependency.
+		import("../../index.ts"),
+	]);
+	_virtualModules = {
+		typebox,
+		"typebox/compile": typeboxCompile,
+		"typebox/value": typeboxValue,
+		"@sinclair/typebox": typebox,
+		"@sinclair/typebox/compile": typeboxCompile,
+		"@sinclair/typebox/value": typeboxValue,
+		"@summon/agent-core": agentCore,
+		"@summon/tui": tui,
+		"@summon/ai": ai,
+		"@summon/ai/oauth": aiOauth,
+		"@summon/coding-agent": codingAgent,
+	};
+	return _virtualModules;
+}
 
 const require = createRequire(import.meta.url);
 
@@ -319,12 +333,16 @@ function createExtensionAPI(
 }
 
 async function loadExtensionModule(extensionPath: string) {
+	// jiti (the runtime TS transpiler) is imported lazily here so it never loads
+	// for invocations that load no TS extension (--help, --version, sealed workers,
+	// most sessions). The specifier is literal, so Bun still bundles it.
+	const { createJiti } = await import("jiti/static");
 	const jiti = createJiti(import.meta.url, {
 		moduleCache: false,
 		// In Bun binary: use virtualModules for bundled packages (no filesystem resolution)
 		// Also disable tryNative so jiti handles ALL imports (not just the entry point)
 		// In Node.js/dev: use aliases to resolve to node_modules paths
-		...(isBunBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
+		...(isBunBinary ? { virtualModules: await getVirtualModules(), tryNative: false } : { alias: getAliases() }),
 	});
 
 	const module = await jiti.import(extensionPath, { default: true });

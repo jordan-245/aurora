@@ -43,8 +43,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
-import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
-import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
+import type { ToolHtmlRenderer } from "./export-html/index.ts";
 import {
 	type ContextUsage,
 	type ExtensionCommandContextActions,
@@ -2965,6 +2964,14 @@ export class AgentSession {
 	 */
 	async exportToHtml(outputPath?: string): Promise<string> {
 		const themeName = this.settingsManager.getTheme();
+
+		// Lazy: export-html pulls highlight.js + marked + the HTML template. Loading it
+		// only inside exportToHtml keeps it out of every non-exporting process — most
+		// notably spawned harness workers, which never export.
+		const [{ exportSessionToHtml }, { createToolHtmlRenderer }] = await Promise.all([
+			import("./export-html/index.ts"),
+			import("./export-html/tool-renderer.ts"),
+		]);
 
 		// Create tool renderer if we have an extension runner (for custom tool HTML rendering)
 		const toolRenderer: ToolHtmlRenderer = createToolHtmlRenderer({

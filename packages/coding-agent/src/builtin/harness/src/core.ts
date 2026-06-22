@@ -573,6 +573,51 @@ export function finalizeResult(
 	};
 }
 
+// Discovery-disabling flags that SEAL a spawned worker: it receives exactly the
+// extension/skill/prompt/theme/context we pass explicitly (--skill, -e guard) and
+// nothing ambient. Each `--no-*` flag drops only *discovered* resources; explicit
+// CLI paths still load (verified in resource-loader: noExtensions/noSkills/etc.
+// keep cliEnabled + additional paths, drop only auto-discovered ones).
+//
+// This is both a perf win — no jiti (TS transpiler) init and no filesystem
+// discovery walks per worker — and an isolation guarantee: a tool-restricted
+// sub-agent can never inherit project AGENTS.md/CLAUDE.md context, a user theme,
+// or a stray TypeScript extension. EVERY spawn path MUST route through
+// buildWorkerArgs so a worker can never be spawned unsealed.
+export const WORKER_SEAL_FLAGS = [
+	"--no-extensions",
+	"--no-skills",
+	"--no-prompt-templates",
+	"--no-themes",
+	"--no-context-files",
+] as const;
+
+// Build the full argv tail shared by every worker transport. `head` carries the
+// mode-specific prefix (e.g. ["-p","--no-session","--mode","json"] for one-shot,
+// ["--mode","rpc","--no-session"] for the pooled rpc worker). The model, system
+// prompt, tool allowlist, seal flags, explicit skill, and write-guard are applied
+// identically so the two transports can never drift apart.
+export function buildWorkerArgs(bundle: AgentBundle, head: string[]): string[] {
+	const args = [
+		...head,
+		"--model",
+		MODEL[bundle.model_tier],
+		"--system-prompt",
+		buildSystemPrompt(bundle),
+		"--tools",
+		bundle.tools.join(","),
+		...WORKER_SEAL_FLAGS,
+	];
+	if (bundle.skills?.length && bundle._dir) {
+		const sk = join(bundle._dir, "SKILL.md");
+		if (existsSync(sk)) args.push("--skill", sk);
+	}
+	// Hardening: load the guard into any worker that can write/exec (blocks destructive bash +
+	// out-of-root / protected-path writes at the tool layer — enforcement, not prompt convention).
+	if (bundle.tools.some((t) => WRITE_TOOLS.has(t))) args.push("-e", GUARD_EXT);
+	return args;
+}
+
 // ── spawn one worker via `summon -p --mode json` (the proven transport) ───────────
 export function spawnOnce(
 	bundle: AgentBundle,
@@ -588,25 +633,7 @@ export function spawnOnce(
 ): Promise<SpawnResult> {
 	const model = MODEL[bundle.model_tier];
 	const sys = buildSystemPrompt(bundle);
-	const args = [
-		"-p",
-		"--no-session",
-		"--mode",
-		"json",
-		"--model",
-		model,
-		"--system-prompt",
-		sys,
-		"--tools",
-		bundle.tools.join(","),
-	];
-	if (bundle.skills?.length && bundle._dir) {
-		const sk = join(bundle._dir, "SKILL.md");
-		if (existsSync(sk)) args.push("--skill", sk);
-	}
-	// Hardening: load the guard into any worker that can write/exec (blocks destructive bash +
-	// out-of-root / protected-path writes at the tool layer — enforcement, not prompt convention).
-	if (bundle.tools.some((t) => t === "bash" || t === "write" || t === "edit")) args.push("-e", GUARD_EXT);
+	const args = buildWorkerArgs(bundle, ["-p", "--no-session", "--mode", "json"]);
 	const env = spawnEnv(opts.root, opts.protected);
 	assertSpawnAuth(env, sys); // fail-closed auth check before we spawn anything
 	const t0 = Date.now();

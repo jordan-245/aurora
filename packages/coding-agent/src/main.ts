@@ -24,7 +24,6 @@ import {
 } from "./core/agent-session-services.ts";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
 import { AuthStorage } from "./core/auth-storage.ts";
-import { exportFromFile } from "./core/export-html/index.ts";
 import type { ExtensionFactory } from "./core/extensions/types.ts";
 import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
 import { KeybindingsManager } from "./core/keybindings.ts";
@@ -42,9 +41,17 @@ import { SessionManager } from "./core/session-manager.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
-import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.ts";
+// Mode-gated heavy imports: import the print/rpc entrypoints from their own
+// modules (NOT the ./modes barrel, which re-exports InteractiveMode and would
+// transitively pull the ~212KB interactive-mode graph into every non-interactive
+// process — -p / json / rpc / spawned workers). InteractiveMode itself is loaded
+// lazily, only on the interactive branch (see below). export-html (highlight.js +
+// marked) is likewise imported dynamically, only when --export runs.
+import type { InteractiveModeOptions } from "./modes/interactive/interactive-mode.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
+import { runPrintMode } from "./modes/print-mode.ts";
+import { runRpcMode } from "./modes/rpc/rpc-mode.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
@@ -472,6 +479,8 @@ export async function main(args: string[], options?: MainOptions) {
 		let result: string;
 		try {
 			const outputPath = parsed.messages.length > 0 ? parsed.messages[0] : undefined;
+			// Lazy: pulls export-html (highlight.js + marked + template) only for --export.
+			const { exportFromFile } = await import("./core/export-html/index.ts");
 			result = await exportFromFile(parsed.export, outputPath);
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : "Failed to export session";
@@ -693,14 +702,18 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {
-		const interactiveMode = new InteractiveMode(runtime, {
+		// Lazy: the interactive TUI graph (theme, components, ~212KB) loads only when
+		// we actually enter interactive mode — never in -p / json / rpc / worker spawns.
+		const { InteractiveMode } = await import("./modes/interactive/interactive-mode.ts");
+		const interactiveModeOptions: InteractiveModeOptions = {
 			migratedProviders,
 			modelFallbackMessage,
 			initialMessage,
 			initialImages,
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
-		});
+		};
+		const interactiveMode = new InteractiveMode(runtime, interactiveModeOptions);
 		if (startupBenchmark) {
 			await interactiveMode.init();
 			time("interactiveMode.init");

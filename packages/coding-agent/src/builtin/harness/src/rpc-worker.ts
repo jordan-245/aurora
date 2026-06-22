@@ -3,7 +3,7 @@
 // JSONL framing: split on \n only, strip trailing \r — never use node readline.
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { type AgentBundle, assertSpawnAuth, buildSystemPrompt, GUARD_EXT, MODEL, spawnEnv } from "./core.ts";
+import { type AgentBundle, assertSpawnAuth, buildSystemPrompt, buildWorkerArgs, spawnEnv } from "./core.ts";
 import { agentSpawnCommand } from "./paths.ts";
 import type { PooledWorker } from "./pool.ts";
 
@@ -11,8 +11,6 @@ export interface RpcRunResult {
 	text: string;
 	ok: boolean; // false on timeout, process death, or prompt rejection
 }
-
-const WRITE_TOOLS = new Set(["bash", "write", "edit"]);
 
 export class RpcWorker implements PooledWorker {
 	readonly id: string;
@@ -31,23 +29,14 @@ export class RpcWorker implements PooledWorker {
 
 	// ── Factory ──────────────────────────────────────────────────────────────
 	static async start(bundle: AgentBundle, opts: { root?: string; protected?: string[] } = {}): Promise<RpcWorker> {
-		const model = MODEL[bundle.model_tier];
 		const sys = buildSystemPrompt(bundle);
 
-		const hasWrite = bundle.tools.some((t) => WRITE_TOOLS.has(t));
-
-		const args = [
-			"--mode",
-			"rpc",
-			"--no-session",
-			"--model",
-			model,
-			"--system-prompt",
-			sys,
-			"--tools",
-			bundle.tools.join(","),
-		];
-		if (hasWrite) args.push("-e", GUARD_EXT);
+		// Shared with the one-shot transport: applies the model, system prompt, tool
+		// allowlist, WORKER_SEAL_FLAGS (no extension/skill/prompt/theme/context
+		// discovery), the explicit skill, and the write-guard. Sealing keeps a pooled
+		// worker fast (no jiti init / fs walks) and isolated (no ambient project
+		// context leaking into a reused, tool-restricted sub-agent).
+		const args = buildWorkerArgs(bundle, ["--mode", "rpc", "--no-session"]);
 
 		const env = spawnEnv(opts.root, opts.protected);
 		assertSpawnAuth(env, sys); // fail-closed auth check before we spawn the rpc worker
