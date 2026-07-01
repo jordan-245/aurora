@@ -29,6 +29,10 @@ export interface Args {
 	tools?: string[];
 	noTools?: boolean;
 	noBuiltinTools?: boolean;
+	/** Hard cap on agentic turns (provider requests) for a single -p/--mode run. */
+	maxTurns?: number;
+	/** Paths to MCP server config(s) whose stdio tools are exposed to the model. Repeatable. */
+	mcpConfig?: string[];
 	extensions?: string[];
 	noExtensions?: boolean;
 	print?: boolean;
@@ -111,6 +115,20 @@ export function parseArgs(args: string[]): Args {
 				.split(",")
 				.map((s) => s.trim())
 				.filter((name) => name.length > 0);
+		} else if (arg === "--max-turns" && i + 1 < args.length) {
+			const raw = args[++i];
+			const n = Number(raw);
+			if (!Number.isInteger(n) || n <= 0) {
+				result.diagnostics.push({
+					type: "error",
+					message: `Invalid --max-turns "${raw}". Expected a positive integer.`,
+				});
+			} else {
+				result.maxTurns = n;
+			}
+		} else if (arg === "--mcp-config" && i + 1 < args.length) {
+			result.mcpConfig = result.mcpConfig ?? [];
+			result.mcpConfig.push(args[++i]);
 		} else if (arg === "--thinking" && i + 1 < args.length) {
 			const level = args[++i];
 			if (isValidThinkingLevel(level)) {
@@ -248,7 +266,13 @@ ${chalk.bold("Options:")}
   --no-tools, -nt                Disable all tools by default (built-in and extension)
   --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
   --tools, -t <tools>            Comma-separated allowlist of tool names to enable
-                                 Applies to built-in, extension, and custom tools
+                                 Applies to built-in, extension, custom, and MCP tools
+  --mcp-config <path>            Load MCP server(s) over stdio and expose their tools to the model.
+                                 <path> is either a JSON file ({"mcpServers":{"<name>":{"command",
+                                 "args","env","cwd"}}}) or a directly executable server command.
+                                 Repeatable. Combine with --tools to allowlist which MCP tools are active.
+  --max-turns <n>                Hard cap on agentic turns (provider requests) per run. The loop stops
+                                 cleanly once reached, bounding tool-calling loops. Default: unbounded.
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh
   --extension, -e <path>         Load an extension file (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)

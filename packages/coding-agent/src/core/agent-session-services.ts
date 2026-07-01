@@ -56,6 +56,7 @@ export interface CreateAgentSessionFromServicesOptions {
 	tools?: string[];
 	noTools?: CreateAgentSessionOptions["noTools"];
 	customTools?: ToolDefinition[];
+	maxTurns?: number;
 }
 
 /**
@@ -194,6 +195,7 @@ export async function createAgentSessionFromServices(
 		tools: options.tools,
 		noTools: options.noTools,
 		customTools: options.customTools,
+		maxTurns: options.maxTurns,
 		sessionStartEvent: options.sessionStartEvent,
 	});
 }

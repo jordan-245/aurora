@@ -27,6 +27,7 @@ import { AuthStorage } from "./core/auth-storage.ts";
 import type { ExtensionFactory } from "./core/extensions/types.ts";
 import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
 import { KeybindingsManager } from "./core/keybindings.ts";
+import { loadMcpServers, loadMcpTools, type McpStdioClient } from "./core/mcp/index.ts";
 import type { ModelRegistry } from "./core/model-registry.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
@@ -383,6 +384,9 @@ function buildSessionOptions(
 	if (parsed.tools) {
 		options.tools = [...parsed.tools];
 	}
+	if (parsed.maxTurns !== undefined) {
+		options.maxTurns = parsed.maxTurns;
+	}
 
 	return { options, cliThinkingFromModel, diagnostics };
 }
@@ -538,6 +542,14 @@ export async function main(args: string[], options?: MainOptions) {
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
 	const authStorage = AuthStorage.create();
+	// Live MCP server connections opened by --mcp-config. Registered for cleanup up front so an early
+	// fail-closed exit (e.g. an MCP load error) still tears down any process already spawned.
+	const mcpClients: McpStdioClient[] = [];
+	const closeMcpClients = (): void => {
+		for (const client of mcpClients) client.close();
+		mcpClients.length = 0;
+	};
+	process.once("exit", closeMcpClients);
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -601,6 +613,26 @@ export async function main(args: string[], options?: MainOptions) {
 			}
 		}
 
+		// --mcp-config: spawn the configured MCP server(s), enumerate their tools, and register them as
+		// custom tools so they flow through the same registry + --tools allowlist as everything else.
+		// Skipped for --help/--list-models (which exit without a real run). A load failure is a fail-closed
+		// error diagnostic (below, main() exits non-zero) so an agentic run never silently proceeds tool-less.
+		if (parsed.mcpConfig && parsed.mcpConfig.length > 0 && !parsed.help && parsed.listModels === undefined) {
+			try {
+				const mcpResult = await loadMcpTools(loadMcpServers(parsed.mcpConfig));
+				mcpClients.push(...mcpResult.clients);
+				if (mcpResult.tools.length > 0) {
+					sessionOptions.customTools = [...(sessionOptions.customTools ?? []), ...mcpResult.tools];
+				}
+				for (const d of mcpResult.diagnostics) {
+					diagnostics.push({ type: d.type, message: d.message });
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				diagnostics.push({ type: "error", message: `--mcp-config load failed: ${message}` });
+			}
+		}
+
 		const created = await createAgentSessionFromServices({
 			services,
 			sessionManager,
@@ -611,6 +643,7 @@ export async function main(args: string[], options?: MainOptions) {
 			tools: sessionOptions.tools,
 			noTools: sessionOptions.noTools,
 			customTools: sessionOptions.customTools,
+			maxTurns: sessionOptions.maxTurns,
 		});
 		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {
@@ -701,6 +734,7 @@ export async function main(args: string[], options?: MainOptions) {
 	if (appMode === "rpc") {
 		printTimings();
 		await runRpcMode(runtime);
+		closeMcpClients();
 	} else if (appMode === "interactive") {
 		// Lazy: the interactive TUI graph (theme, components, ~212KB) loads only when
 		// we actually enter interactive mode — never in -p / json / rpc / worker spawns.
@@ -720,6 +754,7 @@ export async function main(args: string[], options?: MainOptions) {
 			printTimings();
 			interactiveMode.stop();
 			stopThemeWatcher();
+			closeMcpClients();
 			if (process.stdout.writableLength > 0) {
 				await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
 			}
@@ -731,6 +766,7 @@ export async function main(args: string[], options?: MainOptions) {
 
 		printTimings();
 		await interactiveMode.run();
+		closeMcpClients();
 	} else {
 		printTimings();
 		const exitCode = await runPrintMode(runtime, {
@@ -741,6 +777,7 @@ export async function main(args: string[], options?: MainOptions) {
 		});
 		stopThemeWatcher();
 		restoreStdout();
+		closeMcpClients();
 		if (exitCode !== 0) {
 			process.exitCode = exitCode;
 		}

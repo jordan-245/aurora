@@ -68,6 +68,15 @@ export interface CreateAgentSessionOptions {
 	/** Custom tools to register (in addition to built-in tools). */
 	customTools?: ToolDefinition[];
 
+	/**
+	 * Hard cap on the number of agentic turns (provider requests) per prompt.
+	 *
+	 * Forwarded to the underlying {@link Agent}. When reached, the agent loop stops cleanly
+	 * after the current turn instead of issuing another request, bounding tool-calling loops.
+	 * Undefined or <= 0 means unbounded (the default).
+	 */
+	maxTurns?: number;
+
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
 
@@ -382,6 +391,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+		maxTurns: options.maxTurns,
 	});
 
 	// Restore messages if session has existing data

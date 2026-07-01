@@ -316,6 +316,76 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--max-turns flag", () => {
+		test("parses a positive integer", () => {
+			const result = parseArgs(["--max-turns", "12"]);
+			expect(result.maxTurns).toBe(12);
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		test("rejects zero", () => {
+			const result = parseArgs(["--max-turns", "0"]);
+			expect(result.maxTurns).toBeUndefined();
+			expect(result.diagnostics.some((d) => d.type === "error")).toBe(true);
+		});
+
+		test("rejects a non-integer", () => {
+			const result = parseArgs(["--max-turns", "3.5"]);
+			expect(result.maxTurns).toBeUndefined();
+			expect(result.diagnostics.some((d) => d.type === "error")).toBe(true);
+		});
+
+		test("rejects a non-numeric value", () => {
+			const result = parseArgs(["--max-turns", "lots"]);
+			expect(result.maxTurns).toBeUndefined();
+			expect(result.diagnostics.some((d) => d.type === "error")).toBe(true);
+		});
+
+		test("is unset by default", () => {
+			const result = parseArgs(["-p", "hi"]);
+			expect(result.maxTurns).toBeUndefined();
+		});
+	});
+
+	describe("--mcp-config flag", () => {
+		test("parses a single path", () => {
+			const result = parseArgs(["--mcp-config", "/tmp/mcp.json"]);
+			expect(result.mcpConfig).toEqual(["/tmp/mcp.json"]);
+		});
+
+		test("is repeatable", () => {
+			const result = parseArgs(["--mcp-config", "/a/run.sh", "--mcp-config", "/b/mcp.json"]);
+			expect(result.mcpConfig).toEqual(["/a/run.sh", "/b/mcp.json"]);
+		});
+
+		test("is unset by default", () => {
+			const result = parseArgs(["-p", "hi"]);
+			expect(result.mcpConfig).toBeUndefined();
+		});
+
+		test("coexists with a --tools allowlist (agentic scout shape)", () => {
+			const result = parseArgs([
+				"-p",
+				"--model",
+				"claude-fable-5",
+				"--mcp-config",
+				"/crucible/mcp/run.sh",
+				"--tools",
+				"x_search,web_search,research_search,scrape_url,extract_url",
+				"--max-turns",
+				"12",
+				"--mode",
+				"json",
+			]);
+			expect(result.mcpConfig).toEqual(["/crucible/mcp/run.sh"]);
+			expect(result.tools).toEqual(["x_search", "web_search", "research_search", "scrape_url", "extract_url"]);
+			expect(result.maxTurns).toBe(12);
+			expect(result.model).toBe("claude-fable-5");
+			expect(result.mode).toBe("json");
+			expect(result.diagnostics).toEqual([]);
+		});
+	});
+
 	describe("messages and file args", () => {
 		test("parses plain text messages", () => {
 			const result = parseArgs(["hello", "world"]);

@@ -113,6 +113,16 @@ export interface AgentOptions {
 	transport?: Transport;
 	maxRetryDelayMs?: number;
 	toolExecution?: ToolExecutionMode;
+	/**
+	 * Hard cap on the number of assistant turns (provider requests) in a single run.
+	 *
+	 * A "turn" is one assistant response plus any tool calls it triggers. When the count
+	 * reaches `maxTurns`, the loop stops cleanly after the current turn — it emits `agent_end`
+	 * and returns without starting another provider request, so a tool-calling loop can never
+	 * run unbounded. Counts turns per `prompt()`/`continue()` run; `undefined` or `<= 0` means
+	 * no cap. Enforced via the loop's `shouldStopAfterTurn` hook.
+	 */
+	maxTurns?: number;
 }
 
 class PendingMessageQueue {
@@ -197,6 +207,8 @@ export class Agent {
 	public maxRetryDelayMs?: number;
 	/** Tool execution strategy for assistant messages that contain multiple tool calls. */
 	public toolExecution: ToolExecutionMode;
+	/** Hard cap on assistant turns per run. Undefined or <= 0 means unbounded. */
+	public maxTurns?: number;
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -216,6 +228,7 @@ export class Agent {
 		this.transport = options.transport ?? "auto";
 		this.maxRetryDelayMs = options.maxRetryDelayMs;
 		this.toolExecution = options.toolExecution ?? "parallel";
+		this.maxTurns = options.maxTurns;
 	}
 
 	/**
@@ -421,6 +434,19 @@ export class Agent {
 
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
+		// Hard turn cap (--max-turns): count completed turns in THIS run and stop once the cap is
+		// reached, so an agentic tool loop can never run unbounded. `shouldStopAfterTurn` fires exactly
+		// once per turn after `turn_end`; returning true ends the loop cleanly (emits `agent_end`)
+		// before the next provider request. The counter is per-run (one createLoopConfig per prompt).
+		const maxTurns = this.maxTurns;
+		let turnCount = 0;
+		const shouldStopAfterTurn =
+			maxTurns !== undefined && maxTurns > 0
+				? () => {
+						turnCount += 1;
+						return turnCount >= maxTurns;
+					}
+				: undefined;
 		return {
 			model: this._state.model,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
@@ -433,6 +459,7 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			shouldStopAfterTurn,
 			prepareNextTurn: this.prepareNextTurn ? async () => await this.prepareNextTurn?.(this.signal) : undefined,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
